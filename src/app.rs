@@ -4,6 +4,7 @@
 pub struct TemplateApp {
     // Example stuff:
     label: String,
+    location: String,
 
     #[serde(skip)] // This how you opt-out of serialization of a field
     value: f32,
@@ -14,6 +15,7 @@ impl Default for TemplateApp {
         Self {
             // Example stuff:
             label: "Hello World!".to_owned(),
+            location: "https://example.com".to_owned(),
             value: 2.7,
         }
     }
@@ -62,6 +64,8 @@ impl eframe::App for TemplateApp {
                 }
 
                 egui::widgets::global_theme_preference_buttons(ui);
+
+                ui.text_edit_singleline(&mut self.location);
             });
         });
 
