@@ -10,6 +10,7 @@ pub struct TemplateApp {
     label: String,
     location: String,
     page: String,
+    status: String,
 
     #[serde(skip)] // This how you opt-out of serialization of a field
     value: f32,
@@ -22,6 +23,7 @@ impl Default for TemplateApp {
             label: "Hello World!".to_owned(),
             location: "https://example.com".to_owned(),
             page: "".to_owned(),
+            status: "Loaded".to_owned(),
             value: 2.7,
         }
     }
@@ -41,6 +43,18 @@ impl TemplateApp {
         }
 
         Default::default()
+    }
+
+    pub fn navigate(&mut self) -> String {
+        self.status = "Loading...".to_string();
+        println!("URL to navigate to: {}", self.location);
+        //let resp = reqwest::blocking::get(location).unwrap().text();
+        let resp = reqwest::blocking::get(&self.location)
+            .and_then(|r| r.text())
+            .map_err(|e| e.to_string());
+        println!("{:#?}", resp);
+        self.status = "Loaded".to_string();
+        return resp.unwrap_or_else(|_| "Failed to load page".to_string());
     }
 }
 
@@ -68,37 +82,51 @@ impl eframe::App for TemplateApp {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
-                    ui.add_space(16.0);
+                    ui.add_space(3.0);
                 }
 
 
-                let response = ui.text_edit_singleline(&mut self.location);
+                let button_width = 25.0;
+                let text_edit_width = ui.available_width() - button_width;
+                let response = ui.add_sized([text_edit_width.max(0.0), 20.0], egui::TextEdit::singleline(&mut self.location));
                 if response.lost_focus() && response.ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    self.page = navigate(&self.location);
+                    self.status = "Loading...".to_string();
+                    self.page = self.navigate();
+                    self.status = "Loaded".to_string();
                 }
+                ui.add_space(1.0);
+                ui.button(egui_material_icons::icons::ICON_ARROW_FORWARD)
+                    .on_hover_text("Go")
+                    .clicked()
+                    .then(|| {
+                        self.status = "Loading...".to_string();
+                        self.page = self.navigate();
+                        self.status = "Loaded".to_string();
+                    });
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // The central panel the region left after adding TopPanel's and SidePanel's
-            ui.heading("eframe template");
+        egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
+            //powered_by_egui_and_eframe(ui);
+            let mut status_display: String = "Status: ".to_owned();
+            let status: &str = self.status.as_str();
+            status_display.push_str(status);
+            ui.label(status_display);
+        });
 
-            ui.horizontal(|ui| {
-                ui.label("Write something: ");
-                ui.text_edit_singleline(&mut self.label);
-            });
-
-            ui.add(egui::Slider::new(&mut self.value, 0.0..=10.0).text("value"));
-            if ui.button("Increment").clicked() {
-                self.value += 1.0;
-            }
-
+        egui::SidePanel::left("side_panel").show(ctx, |ui| {
+            // The side panel is often a good place for a navigation menu:
             ui.separator();
 
-            ui.add(egui::github_link_file!(
-                "https://github.com/emilk/eframe_template/blob/main/",
-                "Source code."
-            ));
+            if ui.button("Home").clicked() {
+                self.status = "Loading...".to_string();
+                self.page = self.navigate();
+                self.status = "Loaded".to_string();
+            }
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+
             let binding = self.page.clone();
             let markdown = binding.as_str();
 
@@ -108,13 +136,7 @@ impl eframe::App for TemplateApp {
                 CommonMarkViewer::new().show(ui, &mut cache, markdown);
             });
 
-            ui.separator();
 
-            egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Status: Ready");
-                });
-            });
 
             //ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             //    powered_by_egui_and_eframe(ui);
@@ -123,19 +145,11 @@ impl eframe::App for TemplateApp {
             //ui.separator();
             //ui.label("end");
         });
+
     }
 
 }
 
-fn navigate(location: &str) -> String {
-    println!("URL to navigate to: {}", location);
-    //let resp = reqwest::blocking::get(location).unwrap().text();
-    let resp = reqwest::blocking::get(location)
-        .and_then(|r| r.text())
-        .map_err(|e| e.to_string());
-    println!("{:#?}", resp);
-    return resp.unwrap_or_else(|_| "Failed to load page".to_string());
-}
 
 fn powered_by_egui_and_eframe(ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
