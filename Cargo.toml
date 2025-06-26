@@ -21,7 +21,21 @@ eframe = { version = "0.31", default-features = false, features = [
     "x11",           # To support older Linux distributions (restores one of the default features)
 ] }
 log = "0.4.27"
-
+egui_material_icons = "0.3.0" # Material Design icons for egui
+egui_commonmark = { version = "0.20.0", features = [
+    "better_syntax_highlighting",
+    "svg",
+    "fetch",
+    "embedded_image",
+]}
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",  # JPEG support
+    "png",   # PNG support
+    "gif",   # GIF support
+    "webp",  # WebP support
+    "tiff",  # TIFF support
+]}
+reqwest = { version = "0.11", features = ["blocking"] }
 # You only need serde if you want app persistence:
 serde = { version = "1.0.219", features = ["derive"] }
 
