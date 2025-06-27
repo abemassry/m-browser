@@ -1,6 +1,7 @@
 use egui_material_icons;
 use egui_commonmark::*;
 use std::error::Error;
+use pulldown_cmark::{Parser, Options};
 
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -84,6 +85,13 @@ impl eframe::App for TemplateApp {
                     });
                     ui.add_space(3.0);
                 }
+                ui.add_space(1.0);
+                ui.button(egui_material_icons::icons::ICON_ARROW_BACK);
+                ui.add_space(1.0);
+                ui.button(egui_material_icons::icons::ICON_ARROW_FORWARD);
+                ui.add_space(1.0);
+
+
 
 
                 let button_width = 25.0;
@@ -95,7 +103,7 @@ impl eframe::App for TemplateApp {
                     self.status = "Loaded".to_string();
                 }
                 ui.add_space(1.0);
-                ui.button(egui_material_icons::icons::ICON_ARROW_FORWARD)
+                ui.button(egui_material_icons::icons::ICON_KEYBOARD_DOUBLE_ARROW_RIGHT)
                     .on_hover_text("Go")
                     .clicked()
                     .then(|| {
@@ -129,11 +137,44 @@ impl eframe::App for TemplateApp {
 
             let binding = self.page.clone();
             let markdown = binding.as_str();
+            let mut all_links: Vec<String> = Vec::new();
 
             let mut cache = CommonMarkCache::default();
 
             egui::ScrollArea::vertical().show(ui, |ui| {
+                let parser = pulldown_cmark::Parser::new(markdown);
+                for event in parser {
+
+                    match event {
+                        pulldown_cmark::Event::Start(contents) => {
+                            match contents {
+                                pulldown_cmark::Tag::Link{link_type: _, dest_url: url, title: _, id: _} => {
+                                    println!("Found link: {}", url);
+                                    cache.add_link_hook(url.to_string());
+                                    all_links.push(url.to_string());
+                                },
+                                _ => {
+                                }
+                            }
+                        },
+                        _ => {
+                        }
+                    }
+                }
+                ui.style_mut().url_in_tooltip = true;
                 CommonMarkViewer::new().show(ui, &mut cache, markdown);
+                for link in all_links {
+                    if cache.get_link_hook(&link) == Some(true) {
+                        println!("Link was clicked {link}");
+                        self.location = link.clone();
+                        self.status = "Loading...".to_string();
+                        self.page = self.navigate();
+                        self.status = "Loaded".to_string();
+                    }
+                    //ui.hyperlink_to(link, link);
+                }
+
+
             });
 
 
