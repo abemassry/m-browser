@@ -16,5 +16,4 @@ and combine it with the utility of the web that puts the power of the web back i
 
 ## Example inside the M Browser
 
-[Link to first page in example](https://raw.githubusercontent.com/abemassry/m-browser/refs/heads/main/README.md)
 [Link to second page in example](https://raw.githubusercontent.com/abemassry/m-browser/refs/heads/main/pages/SECOND_PAGE.md)
