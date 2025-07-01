@@ -3,6 +3,7 @@ use egui_commonmark::*;
 use std::error::Error;
 use pulldown_cmark::{Parser, Options};
 
+
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(default)] // if we add new fields, give them default values when deserializing old state
@@ -12,6 +13,10 @@ pub struct TemplateApp {
     location: String,
     page: String,
     status: String,
+
+    // for history
+    back: Vec<String>,
+    forward: Vec<String>,
 
     #[serde(skip)] // This how you opt-out of serialization of a field
     value: f32,
@@ -25,6 +30,8 @@ impl Default for TemplateApp {
             location: "https://example.com".to_owned(),
             page: "".to_owned(),
             status: "Loaded".to_owned(),
+            back: Vec::new().to_owned(),
+            forward: Vec::new().to_owned(),
             value: 2.7,
         }
     }
@@ -53,9 +60,45 @@ impl TemplateApp {
         let resp = reqwest::blocking::get(&self.location)
             .and_then(|r| r.text())
             .map_err(|e| e.to_string());
-        println!("{:#?}", resp);
+        //println!("{:#?}", resp);
         self.status = "Loaded".to_string();
         return resp.unwrap_or_else(|_| "Failed to load page".to_string());
+    }
+
+    pub fn visit(&mut self) -> String {
+        self.status = "Loading...".to_string();
+        println!("Visiting URL: {}", self.location);
+        //let resp = reqwest::blocking::get(location).unwrap().text();
+        let resp = reqwest::blocking::get(&self.location)
+            .and_then(|r| r.text())
+            .map_err(|e| e.to_string());
+        self.status = "Loaded".to_string();
+        // update the current page in history
+        println!("self back: {:?}", self.back);
+        println!("self forward: {:?}", self.forward);
+        return resp.unwrap_or_else(|_| "Failed to load page".to_string());
+    }
+
+    pub fn back(&mut self) -> Result<(), Box<dyn Error>> {
+        if let Some(last) = self.back.pop() {
+            self.forward.push(self.location.clone());
+            self.location = last.clone();
+            self.page = self.visit();
+            Ok(())
+        } else {
+            Err("No back history".into())
+        }
+    }
+
+    pub fn forward(&mut self) -> Result<(), Box<dyn Error>> {
+        if let Some(next) = self.forward.pop() {
+            self.back.push(self.location.clone());
+            self.location = next.clone();
+            self.page = self.visit();
+            Ok(())
+        } else {
+            Err("No forward history".into())
+        }
     }
 }
 
@@ -86,9 +129,27 @@ impl eframe::App for TemplateApp {
                     ui.add_space(3.0);
                 }
                 ui.add_space(1.0);
-                ui.button(egui_material_icons::icons::ICON_ARROW_BACK);
+                ui.button(egui_material_icons::icons::ICON_ARROW_BACK)
+                    .on_hover_text("Back")
+                    .clicked()
+                    .then(|| {
+                        if let Err(e) = self.back() {
+                            self.status = e.to_string();
+                        } else {
+                            self.status = "Loaded".to_string();
+                        }
+                    });
                 ui.add_space(1.0);
-                ui.button(egui_material_icons::icons::ICON_ARROW_FORWARD);
+                ui.button(egui_material_icons::icons::ICON_ARROW_FORWARD)
+                    .on_hover_text("Forward")
+                    .clicked()
+                    .then(|| {
+                        if let Err(e) = self.forward() {
+                            self.status = e.to_string();
+                        } else {
+                            self.status = "Loaded".to_string();
+                        }
+                    });
                 ui.add_space(1.0);
 
 
@@ -99,8 +160,11 @@ impl eframe::App for TemplateApp {
                 let response = ui.add_sized([text_edit_width.max(0.0), 20.0], egui::TextEdit::singleline(&mut self.location));
                 if response.lost_focus() && response.ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                     self.status = "Loading...".to_string();
+                    // update the current page in history
+                    self.back.push(self.location.clone());
+                    // clear the forward history
+                    self.forward.clear();
                     self.page = self.navigate();
-                    self.status = "Loaded".to_string();
                 }
                 ui.add_space(1.0);
                 ui.button(egui_material_icons::icons::ICON_KEYBOARD_DOUBLE_ARROW_RIGHT)
@@ -108,8 +172,11 @@ impl eframe::App for TemplateApp {
                     .clicked()
                     .then(|| {
                         self.status = "Loading...".to_string();
+                        // update the current page in history
+                        self.back.push(self.location.clone());
+                        // clear the forward history
+                        self.forward.clear();
                         self.page = self.navigate();
-                        self.status = "Loaded".to_string();
                     });
             });
         });
@@ -129,7 +196,6 @@ impl eframe::App for TemplateApp {
             if ui.button("Home").clicked() {
                 self.status = "Loading...".to_string();
                 self.page = self.navigate();
-                self.status = "Loaded".to_string();
             }
         });
 
@@ -141,6 +207,7 @@ impl eframe::App for TemplateApp {
 
             let mut cache = CommonMarkCache::default();
 
+            ui.style_mut().url_in_tooltip = true;
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let parser = pulldown_cmark::Parser::new(markdown);
                 for event in parser {
@@ -149,7 +216,6 @@ impl eframe::App for TemplateApp {
                         pulldown_cmark::Event::Start(contents) => {
                             match contents {
                                 pulldown_cmark::Tag::Link{link_type: _, dest_url: url, title: _, id: _} => {
-                                    println!("Found link: {}", url);
                                     cache.add_link_hook(url.to_string());
                                     all_links.push(url.to_string());
                                 },
@@ -166,10 +232,13 @@ impl eframe::App for TemplateApp {
                 for link in all_links {
                     if cache.get_link_hook(&link) == Some(true) {
                         println!("Link was clicked {link}");
+                        self.back.push(self.location.clone());
                         self.location = link.clone();
                         self.status = "Loading...".to_string();
+                        // update the current page in history
+                        // clear the forward history
+                        self.forward.clear();
                         self.page = self.navigate();
-                        self.status = "Loaded".to_string();
                     }
                     //ui.hyperlink_to(link, link);
                 }
