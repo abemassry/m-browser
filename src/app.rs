@@ -1,7 +1,9 @@
 use crate::egui_tools::EguiRenderer;
+use crate::wasm::Wasm;
+use crate::winit_wasi::{MyWindowWrapper, WinitEventToSurfaceProxy};
 use egui_wgpu::wgpu::SurfaceError;
 use egui_wgpu::{wgpu, ScreenDescriptor};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalSize, Position};
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -118,7 +120,9 @@ pub struct App {
     instance: wgpu::Instance,
     state: Option<AppState>,
     window: Option<Arc<Window>>,
-    child_window: Option<Window>,
+    child_window: Option<Arc<Window>>,
+    // wasi_surface: Option<wasi_surface_wasmtime::Surface>,
+    wasi_event_handler: Option<WinitEventToSurfaceProxy>,
     parent_window_id: WindowId,
     child_window_id: WindowId,
     current_status: String,
@@ -126,6 +130,7 @@ pub struct App {
     current_tab: String,
     current_page: String,
     tabs: Vec<Tab>,
+    wasm_runtime: Arc<Mutex<Wasm>>,
 }
 
 impl App {
@@ -136,6 +141,8 @@ impl App {
             state: None,
             window: None,
             child_window: None,
+            // wasi_surface: None,
+            wasi_event_handler: None,
             parent_window_id: 1.into(),
             child_window_id: 2.into(),
             current_status: "Loading...".to_string(),
@@ -150,6 +157,7 @@ impl App {
                 back: Vec::new(),
                 forward: Vec::new(),
             }],
+            wasm_runtime: Arc::new(Mutex::new(Wasm::new().unwrap())),
         }
     }
 
@@ -449,6 +457,10 @@ impl ApplicationHandler for App {
             .egui_renderer
             .handle_input(self.window.as_ref().unwrap(), &event);
 
+        if let Some(wasi_event_handler) = &mut self.wasi_event_handler {
+            wasi_event_handler.send_event(&event);
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 println!("The close button was pressed; stopping");
@@ -480,7 +492,28 @@ impl ApplicationHandler for App {
             } => {
                 println!("M key pressed");
                 //let child_window = spawn_child_window(&Arc::try_unwrap(self.window.unwrap().unwrap(), event_loop);
-                self.child_window = Some(spawn_child_window(self.window.as_ref().unwrap().as_ref(), event_loop));
+                let child_window = Arc::new(spawn_child_window(self.window.as_ref().unwrap().as_ref(), event_loop));
+                self.child_window = Some(Arc::clone(&child_window));
+                // self.wasi_surface = Some(wasi_surface_wasmtime::Surface::new(Box::new(MyWindowWrapper(child_window))));
+
+                let surface = wasi_surface_wasmtime::Surface::new(Box::new(MyWindowWrapper(child_window)));
+
+                let surface_proxy: wasi_surface_wasmtime::SurfaceProxy = surface.proxy();
+                self.wasi_event_handler = Some(WinitEventToSurfaceProxy::new(surface_proxy.clone()));
+
+                let wasm_runtime = Arc::clone(&self.wasm_runtime);
+                std::thread::spawn(move || {
+                    pollster::block_on(wasm_runtime.lock().unwrap().run_wasm("component.wasm".to_string(), surface)).unwrap();
+                    // pollster::block_on(wasm_runtime.lock().unwrap().run_wasm("breakout.wasm".to_string(), surface)).unwrap();
+                });
+
+                std::thread::spawn(move || {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(16));
+                        surface_proxy.animation_frame();
+                    }
+                });
+
                 let child_id = self.child_window.as_ref().unwrap().id();
                 println!("Child window created with id: {child_id:?}");
                 self.child_window_id = child_id;

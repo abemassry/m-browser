@@ -1,5 +1,7 @@
 mod app;
 mod egui_tools;
+mod wasm;
+mod winit_wasi;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 
