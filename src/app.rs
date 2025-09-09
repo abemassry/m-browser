@@ -132,6 +132,7 @@ pub struct App {
     tabs: Vec<Tab>,
     wasm_runtime: Arc<Mutex<Wasm>>,
     quit_pressed: bool,
+    spawn_child_window: bool,
 }
 
 impl App {
@@ -160,6 +161,7 @@ impl App {
             }],
             wasm_runtime: Arc::new(Mutex::new(Wasm::new().unwrap())),
             quit_pressed: false,
+            spawn_child_window: false,
         }
     }
 
@@ -280,6 +282,10 @@ impl App {
                             if ui.button("Quit").clicked() {
                                 println!("Quit button clicked");
                                 self.quit_pressed = true;
+                            }
+                            if ui.button("spawn child window (M)").clicked() {
+                                println!("Spawn child window button clicked");
+                                self.spawn_child_window = true;
                             }
                         });
                         ui.add_space(3.0);
@@ -468,6 +474,38 @@ impl ApplicationHandler for App {
             wasi_event_handler.send_event(&event);
         }
 
+        if self.spawn_child_window {
+            self.spawn_child_window = false;
+            println!("M key pressed");
+            //let child_window = spawn_child_window(&Arc::try_unwrap(self.window.unwrap().unwrap(), event_loop);
+            let child_window = Arc::new(spawn_child_window(self.window.as_ref().unwrap().as_ref(), event_loop));
+            self.child_window = Some(Arc::clone(&child_window));
+            // self.wasi_surface = Some(wasi_surface_wasmtime::Surface::new(Box::new(MyWindowWrapper(child_window))));
+
+            let surface = wasi_surface_wasmtime::Surface::new(Box::new(MyWindowWrapper(child_window)));
+
+            let surface_proxy: wasi_surface_wasmtime::SurfaceProxy = surface.proxy();
+            self.wasi_event_handler = Some(WinitEventToSurfaceProxy::new(surface_proxy.clone()));
+
+            let wasm_runtime = Arc::clone(&self.wasm_runtime);
+            std::thread::spawn(move || {
+                pollster::block_on(wasm_runtime.lock().unwrap().run_wasm("component.wasm".to_string(), surface)).unwrap();
+                // pollster::block_on(wasm_runtime.lock().unwrap().run_wasm("breakout.wasm".to_string(), surface)).unwrap();
+            });
+
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(16));
+                    surface_proxy.animation_frame();
+                }
+            });
+
+            let child_id = self.child_window.as_ref().unwrap().id();
+            println!("Child window created with id: {child_id:?}");
+            self.child_window_id = child_id;
+
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 println!("The close button was pressed; stopping");
@@ -487,44 +525,6 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(new_size) => {
                 self.handle_resized(new_size.width, new_size.height);
             }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::KeyM),
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        ..
-                    },
-                ..
-            } => {
-                println!("M key pressed");
-                //let child_window = spawn_child_window(&Arc::try_unwrap(self.window.unwrap().unwrap(), event_loop);
-                let child_window = Arc::new(spawn_child_window(self.window.as_ref().unwrap().as_ref(), event_loop));
-                self.child_window = Some(Arc::clone(&child_window));
-                // self.wasi_surface = Some(wasi_surface_wasmtime::Surface::new(Box::new(MyWindowWrapper(child_window))));
-
-                let surface = wasi_surface_wasmtime::Surface::new(Box::new(MyWindowWrapper(child_window)));
-
-                let surface_proxy: wasi_surface_wasmtime::SurfaceProxy = surface.proxy();
-                self.wasi_event_handler = Some(WinitEventToSurfaceProxy::new(surface_proxy.clone()));
-
-                let wasm_runtime = Arc::clone(&self.wasm_runtime);
-                std::thread::spawn(move || {
-                    pollster::block_on(wasm_runtime.lock().unwrap().run_wasm("component.wasm".to_string(), surface)).unwrap();
-                    // pollster::block_on(wasm_runtime.lock().unwrap().run_wasm("breakout.wasm".to_string(), surface)).unwrap();
-                });
-
-                std::thread::spawn(move || {
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_millis(16));
-                        surface_proxy.animation_frame();
-                    }
-                });
-
-                let child_id = self.child_window.as_ref().unwrap().id();
-                println!("Child window created with id: {child_id:?}");
-                self.child_window_id = child_id;
-            },
             _ => (),
         }
     }
