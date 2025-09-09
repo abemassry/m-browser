@@ -316,21 +316,25 @@ impl App {
                         if response.lost_focus() && response.ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                             self.current_status = "Loading...".to_string();
                             self.current_page = go(self.current_location.clone());
-                            self.child_window_id = 2.into(); // hide child window
-                            self.child_window = None;
-                            for tab in &mut self.tabs {
-                                if tab.label == self.current_tab {
-                                    tab.back.push(tab.location.clone());
-                                    tab.forward.clear(); // clear forward history
-                                    tab.location = self.current_location.clone();
-                                    tab.contents = self.current_page.clone();
-                                    tab.label = get_heading(tab.contents.clone());
-                                    self.current_tab = tab.label.clone();
-                                    break;
+                            if is_wasm(self.current_location.clone()) {
+                                self.spawn_child_window = true;
+                            } else {
+                                self.child_window_id = 2.into(); // hide child window
+                                self.child_window = None;
+                                for tab in &mut self.tabs {
+                                    if tab.label == self.current_tab {
+                                        tab.back.push(tab.location.clone());
+                                        tab.forward.clear(); // clear forward history
+                                        tab.location = self.current_location.clone();
+                                        tab.contents = self.current_page.clone();
+                                        tab.label = get_heading(tab.contents.clone());
+                                        self.current_tab = tab.label.clone();
+                                        break;
+                                    }
                                 }
-                            }
 
-                            self.current_status = "Loaded".to_string();
+                                self.current_status = "Loaded".to_string();
+                            }
                         }
                         ui.add_space(1.0);
 
@@ -340,9 +344,13 @@ impl App {
                             .then(|| {
                                 self.current_status = "Loading...".to_string();
                                 self.current_page = go(self.current_location.clone());
-                                self.child_window_id = 2.into(); // hide child window
-                                self.child_window = None;
-                                self.current_status = "Loaded".to_string();
+                                if is_wasm(self.current_location.clone()) {
+                                    self.spawn_child_window = true;
+                                } else {
+                                    self.child_window_id = 2.into(); // hide child window
+                                    self.child_window = None;
+                                    self.current_status = "Loaded".to_string();
+                                }
                             });
 
                     });
@@ -420,9 +428,13 @@ impl App {
                                     self.current_location = link.clone();
                                     self.current_status = "Loading...".to_string();
                                     self.current_page = go(self.current_location.clone());
-                                    self.child_window_id = 2.into(); // hide child window
-                                    self.child_window = None;
-                                    self.current_status = "Loaded".to_string();
+                                    if is_wasm(self.current_location.clone()) {
+                                        self.spawn_child_window = true;
+                                    } else {
+                                        self.child_window_id = 2.into(); // hide child window
+                                        self.child_window = None;
+                                        self.current_status = "Loaded".to_string();
+                                    }
                                 }
                                 //ui.hyperlink_to(link, link);
                             }
@@ -489,7 +501,7 @@ impl ApplicationHandler for App {
 
             let wasm_runtime = Arc::clone(&self.wasm_runtime);
             std::thread::spawn(move || {
-                pollster::block_on(wasm_runtime.lock().unwrap().run_wasm("component.wasm".to_string(), surface)).unwrap();
+                pollster::block_on(wasm_runtime.lock().unwrap().run_wasm("downloaded.wasm".to_string(), surface)).unwrap();
                 // pollster::block_on(wasm_runtime.lock().unwrap().run_wasm("breakout.wasm".to_string(), surface)).unwrap();
             });
 
@@ -567,12 +579,33 @@ pub fn navigate(location: String) -> String {
     // Implement navigation logic here
     // For now, just return Ok
     println!("Navigating to URL: {}", location);
-    let resp = reqwest::blocking::get(location)
+    if is_wasm(location.clone()) {
+        println!("Downloading wasm file");
+        let wasm_file = download_wasm(location.clone());
+        return wasm_file;
+    }
+    let resp = reqwest::blocking::get(location.clone())
         .and_then(|r| r.text())
         .map_err(|e| e.to_string());
+
     //println!("{:#?}", resp);
     //self.current_status = "Loaded".to_string();
     return resp.unwrap_or_else(|_| "Failed to load page".to_string());
+}
+
+pub fn download_wasm(url: String) -> String {
+    let resp = reqwest::blocking::get(url.clone())
+        .and_then(|r| r.bytes())
+        .map_err(|e| e.to_string());
+    let wasm_bytes = resp.unwrap();
+    // save wasm_bytes to a file
+    // let wasm_path = format!("./{}.wasm", url.replace("https://", "").replace("/", "_"));
+    let wasm_path = "downloaded.wasm".to_string();
+    std::fs::write(&wasm_path, wasm_bytes).unwrap_or_else(|_| {
+        eprintln!("Failed to write wasm file to {}", wasm_path);
+    });
+    return wasm_path;
+
 }
 
 fn get_heading(contents: String) -> String {
@@ -598,4 +631,11 @@ fn get_heading(contents: String) -> String {
         }
     }
     heading
+}
+
+fn is_wasm(filename: String) -> bool {
+    if filename.ends_with(".wasm") {
+        return true;
+    }
+    false
 }
