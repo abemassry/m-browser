@@ -131,6 +131,7 @@ pub struct App {
     current_page: String,
     tabs: Vec<Tab>,
     wasm_runtime: Arc<Mutex<Wasm>>,
+    quit_pressed: bool,
 }
 
 impl App {
@@ -158,6 +159,7 @@ impl App {
                 forward: Vec::new(),
             }],
             wasm_runtime: Arc::new(Mutex::new(Wasm::new().unwrap())),
+            quit_pressed: false,
         }
     }
 
@@ -277,6 +279,7 @@ impl App {
                             egui::widgets::global_theme_preference_buttons(ui);
                             if ui.button("Quit").clicked() {
                                 println!("Quit button clicked");
+                                self.quit_pressed = true;
                             }
                         });
                         ui.add_space(3.0);
@@ -450,6 +453,10 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        if self.quit_pressed {
+            println!("Quit pressed, exiting.");
+            event_loop.exit();
+        }
         // let egui render to process the event first
         self.state
             .as_mut()
