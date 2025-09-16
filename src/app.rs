@@ -4,6 +4,8 @@ use crate::winit_wasi::{MyWindowWrapper, WinitEventToSurfaceProxy};
 use egui_wgpu::wgpu::SurfaceError;
 use egui_wgpu::{wgpu, ScreenDescriptor};
 use std::sync::{Arc, Mutex};
+use std::mem::{drop};
+use std::sync::mpsc;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalSize, Position};
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -133,6 +135,7 @@ pub struct App {
     wasm_runtime: Arc<Mutex<Wasm>>,
     quit_pressed: bool,
     spawn_child_window: bool,
+    close_child_window: bool,
 }
 
 impl App {
@@ -162,6 +165,7 @@ impl App {
             wasm_runtime: Arc::new(Mutex::new(Wasm::new().unwrap())),
             quit_pressed: false,
             spawn_child_window: false,
+            close_child_window: false,
         }
     }
 
@@ -319,8 +323,8 @@ impl App {
                             if is_wasm(self.current_location.clone()) {
                                 self.spawn_child_window = true;
                             } else {
-                                self.child_window_id = 2.into(); // hide child window
-                                self.child_window = None;
+                                println!("Closing child window if open");
+                                self.close_child_window = true;
                                 for tab in &mut self.tabs {
                                     if tab.label == self.current_tab {
                                         tab.back.push(tab.location.clone());
@@ -347,8 +351,8 @@ impl App {
                                 if is_wasm(self.current_location.clone()) {
                                     self.spawn_child_window = true;
                                 } else {
-                                    self.child_window_id = 2.into(); // hide child window
-                                    self.child_window = None;
+                                    println!("Closing child window if open");
+                                    self.close_child_window = true;
                                     self.current_status = "Loaded".to_string();
                                 }
                             });
@@ -431,8 +435,8 @@ impl App {
                                     if is_wasm(self.current_location.clone()) {
                                         self.spawn_child_window = true;
                                     } else {
-                                        self.child_window_id = 2.into(); // hide child window
-                                        self.child_window = None;
+                                        println!("Closing child window if open");
+                                        self.close_child_window = true;
                                         self.current_status = "Loaded".to_string();
                                     }
                                 }
@@ -471,6 +475,7 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        let (tx, rx) = mpsc::channel();
         if self.quit_pressed {
             println!("Quit pressed, exiting.");
             event_loop.exit();
@@ -488,8 +493,16 @@ impl ApplicationHandler for App {
 
         if self.spawn_child_window {
             self.spawn_child_window = false;
+
+            if self.child_window.is_some() {
+                println!("Child window already exists, closing it.");
+                self.child_window_id = 2.into(); // hide child window
+                self.child_window = None;
+                self.wasi_event_handler = None;
+                tx.send("quit").unwrap();
+            }
             println!("M key pressed");
-            //let child_window = spawn_child_window(&Arc::try_unwrap(self.window.unwrap().unwrap(), event_loop);
+            //let child_window = spawn_child_window(&Arc::try_unwrap(self.window.unwrap().unwrap(), event_loop);:
             let child_window = Arc::new(spawn_child_window(self.window.as_ref().unwrap().as_ref(), event_loop));
             self.child_window = Some(Arc::clone(&child_window));
             // self.wasi_surface = Some(wasi_surface_wasmtime::Surface::new(Box::new(MyWindowWrapper(child_window))));
@@ -509,6 +522,12 @@ impl ApplicationHandler for App {
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(16));
                     surface_proxy.animation_frame();
+                    let received = rx.try_recv();
+                    //println!("{:?}",received);
+                    if received.is_ok() {
+                        println!("Received quit signal in child window thread.");
+                        break;
+                    }
                 }
             });
 
@@ -516,6 +535,19 @@ impl ApplicationHandler for App {
             println!("Child window created with id: {child_id:?}");
             self.child_window_id = child_id;
 
+        }
+
+        if self.close_child_window {
+            self.close_child_window = false;
+            if self.child_window.is_some() {
+                println!("Closing child window.");
+                self.child_window_id = 2.into(); // hide child window
+                self.child_window.clone().expect("REASON").set_visible(false);
+                self.child_window = None;
+                self.wasi_event_handler = None;
+                self.wasm_runtime = Arc::new(Mutex::new(Wasm::new().unwrap()));
+                tx.send("quit").unwrap();
+            }
         }
 
         match event {
