@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
 
 use anyhow::Context;
 // use clap::Parser;
@@ -133,7 +134,7 @@ pub struct Wasm {
     surface: Arc<Mutex<Option<Surface>>>,
 }
 impl Wasm {
-    pub fn new() -> anyhow::Result<Wasm> {
+    pub fn new(rx: mpsc::Receiver<()>) -> anyhow::Result<Wasm> {
         // env_logger::builder()
         //     .filter_level(log::LevelFilter::Info)
         //     .init();
@@ -143,6 +144,7 @@ impl Wasm {
         let mut config = Config::default();
         config.wasm_component_model(true);
         config.async_support(true);
+        config.epoch_interruption(true);
         let engine = Engine::new(&config)?;
         let mut linker: Linker<HostState> = Linker::new(&engine);
 
@@ -167,9 +169,21 @@ impl Wasm {
         let host_state = HostState::new();
         let surface = Arc::clone(&host_state.surface);
 
-        let store = Store::new(&engine, host_state);
+        let mut store = Store::new(&engine, host_state);
+        store.set_epoch_deadline(1);
 
         // main_thread_loop.run();
+        let e2 = engine.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if rx.try_recv().is_ok() {
+                    println!("Exiting epoch thread");
+                    e2.increment_epoch();
+                    break;
+                }
+            }
+        });
 
         Ok(Wasm {
             engine,
@@ -181,7 +195,14 @@ impl Wasm {
 
     pub async fn run_wasm(&mut self, wasm_path: String, surface: Surface) -> anyhow::Result<()> {
 
-        self.surface.lock().unwrap().replace(surface);
+        //self.surface.lock().unwrap().replace(surface);
+        match self.surface.lock() {
+            Ok(mut guard) => guard.replace(surface),
+            Err(_) => {
+                println!("Failed to lock surface mutex:");
+                return Err(anyhow::anyhow!("Failed to lock surface mutex"));
+            }
+        };
         // let wasm_path = format!("./triangle.wasm");
 
         let component =
@@ -191,7 +212,7 @@ impl Wasm {
         //     .await
         //     .unwrap();
 
-        
+
         let instance =
             wasmtime_wasi::bindings::Command::instantiate_async(&mut self.store, &component, &self.linker)
                 .await
@@ -199,14 +220,26 @@ impl Wasm {
 
 
         // tokio::spawn(async move {
-            instance.wasi_cli_run().call_run(&mut self.store)
-                .await
-                .context("failed to invoke `run` function")
-                .unwrap()
-                .unwrap();
+        match instance.wasi_cli_run().call_run(&mut self.store).await.context("failed to invoke `run` function") {
+            Ok(Ok(())) => println!("Wasm run completed successfully"),
+            Ok(Err(trap)) => println!("Wasm run trapped: {:?}", trap),
+            Err(e) => println!("Error invoking wasm run: {}", e),
+        };
+            //instance.wasi_cli_run().call_run(&mut self.store)
+            //    .await
+            //    .context("failed to invoke `run` function")
+            //    .unwrap()
+            //    .unwrap();
 
         // });
 
+        Ok(())
+    }
+
+    pub async fn stop_wasm(&mut self) -> anyhow::Result<()> {
+        println!("Stopping wasm");
+        // self.store.data_mut().surface_proxy = None;
+        //self.store.data_mut().surface.lock().unwrap().take();
         Ok(())
     }
 }
