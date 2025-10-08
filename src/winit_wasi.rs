@@ -44,7 +44,7 @@ impl WinitEventToSurfaceProxy {
                     x: position.x,
                     y: position.y,
                 });
-                
+
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
@@ -95,7 +95,7 @@ impl WinitEventToSurfaceProxy {
                     height: new_size.height,
                     width: new_size.width,
                 });
-            
+
             }
             _ => {}
         }
@@ -159,9 +159,19 @@ impl WasiWinitEventLoop {
         {
             let proxies = Arc::clone(&proxies);
             thread::spawn(move || loop {
-                for (_, proxy) in proxies.lock().unwrap().iter() {
-                    proxy.animation_frame();
+                match proxies.lock() {
+                    Ok(guard) => {
+                        for (_, proxy) in guard.iter() {
+                            proxy.animation_frame();
+                        }
+                    },
+                    Err(e) => {
+                        println!("Failed to lock proxies: {}", e);
+                    }
                 }
+                //for (_, proxy) in proxies.lock().unwrap().iter() {
+                //    proxy.animation_frame();
+                //}
                 sleep(Duration::from_millis(16));
             });
         }

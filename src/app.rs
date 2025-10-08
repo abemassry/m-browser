@@ -137,12 +137,16 @@ pub struct App {
     spawn_child_window: bool,
     close_child_window: bool,
     sender: Option<mpsc::Sender<()>>,
+    event_sender: Option<mpsc::Sender<()>>,
+    event_receiver: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
+
 }
 
 impl App {
     pub fn new() -> Self {
         let instance = egui_wgpu::wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let (tx, rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
         Self {
             instance,
             state: None,
@@ -169,6 +173,8 @@ impl App {
             spawn_child_window: false,
             close_child_window: false,
             sender: Some(tx),
+            event_sender: Some(event_tx),
+            event_receiver: Some(Arc::new(Mutex::new(event_rx))),
         }
     }
 
@@ -496,6 +502,24 @@ impl ApplicationHandler for App {
 
         if self.spawn_child_window {
             self.spawn_child_window = false;
+            if self.child_window.is_some() {
+                println!("About to stop wasm using wasm_runtime_events from new spawn");
+                //pollster::block_on(wasm_runtime_events.lock().expect("REASON").stop_wasm()).unwrap();
+                self.event_sender.as_ref().unwrap().send(()).unwrap();
+                self.sender.as_ref().unwrap().send(()).unwrap();
+                println!("Closing child window.");
+                self.child_window_id = 2.into(); // hide child window
+                self.child_window.clone().expect("REASON").set_visible(false);
+                self.child_window = None;
+                self.wasi_event_handler = None;
+                let (tx, rx) = mpsc::channel();
+                let (event_tx, event_rx) = mpsc::channel();
+                self.sender = Some(tx);
+                self.event_sender = Some(event_tx);
+                self.event_receiver = Some(Arc::new(Mutex::new(event_rx)));
+                self.wasm_runtime = Arc::new(Mutex::new(Wasm::new(rx).unwrap()));
+            }
+            let event_receiver = self.event_receiver.clone().unwrap();
             println!("Spawned child window.");
 
             if self.child_window.is_some() {
@@ -517,21 +541,29 @@ impl ApplicationHandler for App {
 
             let wasm_runtime_start = Arc::clone(&self.wasm_runtime);
             std::thread::spawn(move || {
-                pollster::block_on(wasm_runtime_start.lock().unwrap().run_wasm("downloaded.wasm".to_string(), surface)).unwrap();
-
+                match wasm_runtime_start.lock() {
+                    Ok(mut guard) => {
+                        match pollster::block_on(guard.run_wasm("downloaded.wasm".to_string(), surface)) {
+                            Ok(_) => println!("Wasm ran successfully"),
+                            Err(e) => println!("Error running wasm: {e}"),
+                        }
+                    },
+                    Err(e) => {
+                        println!("Failed to lock wasm runtime mutex: {e}");
+                    }
+                }
                 // pollster::block_on(wasm_runtime.lock().unwrap().run_wasm("breakout.wasm".to_string(), surface)).unwrap();
             });
 
-            let close_child_window2 = self.close_child_window.clone();
 
             std::thread::spawn(move || {
                 loop {
-                    std::thread::sleep(std::time::Duration::from_millis(16));
-                    surface_proxy.animation_frame();
-                    if close_child_window2 {
+                    if event_receiver.lock().expect("REASON").try_recv().is_ok() {
                         println!("Close child window signal received in thread.");
                         break;
                     }
+                    surface_proxy.animation_frame();
+                    std::thread::sleep(std::time::Duration::from_millis(16));
                     //if received.is_ok() {
                     //    println!("Received quit signal in child window thread.");
                     //    pollster::block_on(wasm_runtime_events.lock().unwrap().stop_wasm()).unwrap();
@@ -552,6 +584,7 @@ impl ApplicationHandler for App {
             if self.child_window.is_some() {
                 println!("About to stop wasm using wasm_runtime_events");
                 //pollster::block_on(wasm_runtime_events.lock().expect("REASON").stop_wasm()).unwrap();
+                self.event_sender.as_ref().unwrap().send(()).unwrap();
                 self.sender.as_ref().unwrap().send(()).unwrap();
                 println!("Closing child window.");
                 self.child_window_id = 2.into(); // hide child window
@@ -559,7 +592,10 @@ impl ApplicationHandler for App {
                 self.child_window = None;
                 self.wasi_event_handler = None;
                 let (tx, rx) = mpsc::channel();
+                let (event_tx, event_rx) = mpsc::channel();
                 self.sender = Some(tx);
+                self.event_sender = Some(event_tx);
+                self.event_receiver = Some(Arc::new(Mutex::new(event_rx)));
                 self.wasm_runtime = Arc::new(Mutex::new(Wasm::new(rx).unwrap()));
             }
         }
@@ -592,8 +628,8 @@ fn spawn_child_window(parent: &Window, event_loop: &ActiveEventLoop) -> Window {
     let parent = parent.raw_window_handle().unwrap();
     let mut window_attributes = Window::default_attributes()
         .with_title("child window")
-        .with_inner_size(LogicalSize::new(400.0f32, 400.0f32))
-        .with_position(Position::Logical(LogicalPosition::new(300.0, 300.0)))
+        .with_inner_size(LogicalSize::new(1080.0f32, 720.0f32))
+        .with_position(Position::Logical(LogicalPosition::new(200.0, 27.0)))
         .with_visible(true);
     // `with_parent_window` is unsafe. Parent window must be a valid window.
     window_attributes = unsafe { window_attributes.with_parent_window(Some(parent)) };
