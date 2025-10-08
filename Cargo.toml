@@ -1,0 +1,54 @@
+[package]
+name = "m-browser"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+egui = "0.31.1"
+egui-wgpu = { version = "0.31.1",features = ["winit"] }
+egui-winit = "0.31.1"
+winit = "0.30.9"
+pollster = "0.4.0"
+egui_material_icons = "0.3.0"
+pulldown-cmark = "0.13.0"
+egui_commonmark = { version = "0.20.0", features = [
+    "better_syntax_highlighting",
+    "svg",
+    "fetch",
+    "embedded_image",
+]}
+reqwest = { version = "0.12.22", features = ["blocking"] }
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",  # JPEG support
+    "png",   # PNG support
+    "gif",   # GIF support
+    "webp",  # WebP support
+    "tiff",  # TIFF support
+]}
+wasi-graphics-context-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "5c0fc8bb2b597d477236beb00488755d1e94a02d" }
+wasi-surface-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "5c0fc8bb2b597d477236beb00488755d1e94a02d", features = ["winit"] }
+wasi-webgpu-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "5c0fc8bb2b597d477236beb00488755d1e94a02d" }
+
+
+
+
+
+wasmtime = { version = "31.0", features = ['component-model'] }
+wasmtime-wasi = "31.0"
+anyhow = "1.0"
+# winit = { version = "0.30", features = [ "android-native-activity" ] }
+wgpu-core = "24"
+wgpu-types = "24"
+raw-window-handle = "0.6"
+async-trait = "0.1"
+rand = "0.9"
+futures = "0.3"
+tokio = { version = "1.44", features = ["full"] }
+softbuffer = "0.4"
+env_logger = "0.11"
+log = "0.4"
+async-broadcast = "0.7"
+oneshot = "0.1"
+wit-bindgen = "0.41"
+callback-future = "0.1"
+bytemuck = "1"
