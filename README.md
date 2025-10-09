@@ -12,7 +12,7 @@ and combine it with the utility of the web that puts the power of the web back i
   feature)
 - **Display WASM**: Display wasm files in a canvas that renders by default. (planned feature)
 - **Legacy Webpages**: Display legacy webpages in a container that runs a full system including a
-  browser, through wasm, that renders to a canvas. (planned feature)
+  browser, through wasm, that renders to a surface. (planned feature)
 
 ## Example inside the M Browser
 
