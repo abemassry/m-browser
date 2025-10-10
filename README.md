@@ -10,10 +10,12 @@ and combine it with the utility of the web that puts the power of the web back i
 - **Display Markdown**: Display markdown files by default.
 - **JSON format**: Display Markdown and or wasm files if specified in a json file. (planned
   feature)
-- **Display WASM**: Display wasm files in a canvas that renders by default. (planned feature)
+- **Display WASM**: Display wasm files in a surface that renders by default.
 - **Legacy Webpages**: Display legacy webpages in a container that runs a full system including a
-  browser, through wasm, that renders to a canvas. (planned feature)
+  browser, through wasm, that renders to a surface. (planned feature)
 
 ## Example inside the M Browser
 
 [Link to second page in example](https://raw.githubusercontent.com/abemassry/m-browser/refs/heads/main/pages/SECOND_PAGE.md)
+
+[Link to wasm example](https://wsnd.io/ExZz2nOm/component.wasm)

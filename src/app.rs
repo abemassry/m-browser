@@ -157,12 +157,12 @@ impl App {
             parent_window_id: 1.into(),
             child_window_id: 2.into(),
             current_status: "Loading...".to_string(),
-            current_location: "https://example.com/".to_string(),
+            current_location: "https://raw.githubusercontent.com/abemassry/m-browser/refs/heads/main/README.md".to_string(),
             current_tab: "".to_string(),
             current_page: "".to_string(),
             tabs: vec![Tab {
                 label: "".to_string(),
-                location: "https://example.com/".to_string(),
+                location: "https://raw.githubusercontent.com/abemassry/m-browser/refs/heads/main/README.md".to_string(),
                 status: "Loaded".to_string(),
                 contents: "".to_string(),
                 back: Vec::new(),
@@ -389,7 +389,7 @@ impl App {
                     if ui.button("+").clicked() {
                         let new_tab = Tab {
                             label: "New Tab".to_owned(),
-                            location: "https://example.com".to_owned(),
+                            location: "https://raw.githubusercontent.com/abemassry/m-browser/refs/heads/main/README.md".to_owned(),
                             status: "Loaded".to_owned(),
                             contents: "".to_owned(),
                             back: Vec::new().to_owned(),
