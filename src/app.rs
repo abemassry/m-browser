@@ -378,11 +378,27 @@ impl App {
 
                 egui::SidePanel::left("side_panel").show(state.egui_renderer.context(), |ui| {
                     ui.separator();
-                    for tab in &self.tabs {
+                    for tab in &mut self.tabs {
                         if ui.button(&tab.label).clicked() {
                             self.current_location = tab.location.clone();
                             self.current_page = tab.contents.clone();
                             self.current_tab = tab.label.clone();
+                            go(self.current_location.clone());
+                            if is_wasm(self.current_location.clone()) {
+                                self.spawn_child_window = true;
+                            } else {
+                                println!("Closing child window if open, tab");
+                                self.close_child_window = true;
+                                if tab.label == self.current_tab {
+                                    tab.back.push(tab.location.clone());
+                                    tab.forward.clear(); // clear forward history
+                                    tab.location = self.current_location.clone();
+                                    tab.contents = self.current_page.clone();
+                                    tab.label = get_heading(tab.contents.clone());
+                                }
+
+                                self.current_status = "Loaded".to_string();
+                            }
                         }
                     }
 
