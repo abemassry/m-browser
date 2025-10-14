@@ -26,6 +26,7 @@ struct Tab {
     label: String,
     location: String,
     status: String,
+    identifier: i32,
 
     // currently loaded page of tab
     contents: String,
@@ -129,9 +130,10 @@ pub struct App {
     child_window_id: WindowId,
     current_status: String,
     current_location: String,
-    current_tab: String,
+    current_tab: i32,
     current_page: String,
     tabs: Vec<Tab>,
+    tab_counter: i32,
     wasm_runtime: Arc<Mutex<Wasm>>,
     quit_pressed: bool,
     spawn_child_window: bool,
@@ -158,7 +160,7 @@ impl App {
             child_window_id: 2.into(),
             current_status: "Loading...".to_string(),
             current_location: "https://raw.githubusercontent.com/abemassry/m-browser/refs/heads/main/README.md".to_string(),
-            current_tab: "".to_string(),
+            current_tab: 0,
             current_page: "".to_string(),
             tabs: vec![Tab {
                 label: "".to_string(),
@@ -167,7 +169,9 @@ impl App {
                 contents: "".to_string(),
                 back: Vec::new(),
                 forward: Vec::new(),
+                identifier: 0,
             }],
+            tab_counter: 0,
             wasm_runtime: Arc::new(Mutex::new(Wasm::new(rx).unwrap())),
             quit_pressed: false,
             spawn_child_window: false,
@@ -335,13 +339,12 @@ impl App {
                                 println!("Closing child window if open, tab");
                                 self.close_child_window = true;
                                 for tab in &mut self.tabs {
-                                    if tab.label == self.current_tab {
+                                    if tab.identifier == self.current_tab {
                                         tab.back.push(tab.location.clone());
                                         tab.forward.clear(); // clear forward history
                                         tab.location = self.current_location.clone();
                                         tab.contents = self.current_page.clone();
-                                        tab.label = get_heading(tab.contents.clone());
-                                        self.current_tab = tab.label.clone();
+                                        tab.label = get_heading(tab.location.clone(), tab.contents.clone());
                                         break;
                                     }
                                 }
@@ -380,29 +383,28 @@ impl App {
                     ui.separator();
                     for tab in &mut self.tabs {
                         if ui.button(&tab.label).clicked() {
+                            self.current_tab = tab.identifier;
                             self.current_location = tab.location.clone();
-                            self.current_page = tab.contents.clone();
-                            self.current_tab = tab.label.clone();
-                            go(self.current_location.clone());
+                            self.current_page = go(self.current_location.clone());
                             if is_wasm(self.current_location.clone()) {
                                 self.spawn_child_window = true;
                             } else {
                                 println!("Closing child window if open, tab");
                                 self.close_child_window = true;
-                                if tab.label == self.current_tab {
-                                    tab.back.push(tab.location.clone());
-                                    tab.forward.clear(); // clear forward history
-                                    tab.location = self.current_location.clone();
-                                    tab.contents = self.current_page.clone();
-                                    tab.label = get_heading(tab.contents.clone());
-                                }
-
-                                self.current_status = "Loaded".to_string();
                             }
+                            println!("inside if statement for tab");
+                            tab.back.push(tab.location.clone());
+                            tab.forward.clear(); // clear forward history
+                            tab.location = self.current_location.clone();
+                            tab.contents = self.current_page.clone();
+                            tab.label = get_heading(tab.location.clone(), tab.contents.clone());
+
+                            self.current_status = "Loaded".to_string();
                         }
                     }
 
                     if ui.button("+").clicked() {
+                        self.tab_counter += 1;
                         let new_tab = Tab {
                             label: "New Tab".to_owned(),
                             location: "https://raw.githubusercontent.com/abemassry/m-browser/refs/heads/main/README.md".to_owned(),
@@ -410,11 +412,13 @@ impl App {
                             contents: "".to_owned(),
                             back: Vec::new().to_owned(),
                             forward: Vec::new().to_owned(),
+                            identifier: self.tab_counter,
                         };
                         self.tabs.push(new_tab.clone());
-                        self.current_tab = new_tab.label.clone();
+                        self.current_tab = self.tab_counter;
                         self.current_location = new_tab.location.clone();
                         self.current_page = new_tab.contents.clone();
+                        go(self.current_location.clone());
                     }
                 });
 
@@ -462,6 +466,18 @@ impl App {
                                     } else {
                                         println!("Closing child window if open, link");
                                         self.close_child_window = true;
+                                        self.current_status = "Loaded".to_string();
+                                    }
+                                    for tab in &mut self.tabs {
+                                        if tab.identifier == self.current_tab {
+                                            println!("inside if statement for tab");
+                                            tab.back.push(tab.location.clone());
+                                            tab.forward.clear(); // clear forward history
+                                            tab.location = self.current_location.clone();
+                                            tab.contents = self.current_page.clone();
+                                            tab.label = get_heading(tab.location.clone(), tab.contents.clone());
+                                        }
+
                                         self.current_status = "Loaded".to_string();
                                     }
                                 }
@@ -706,7 +722,7 @@ pub fn download_wasm(url: String) -> String {
 
 }
 
-fn get_heading(contents: String) -> String {
+fn get_heading(location: String, contents: String) -> String {
     let mut heading = String::new();
     let mut in_heading = false;
     let parser = Parser::new_ext(&contents, Options::empty());
@@ -728,6 +744,11 @@ fn get_heading(contents: String) -> String {
             _ => {}
         }
     }
+    if heading.is_empty() {
+        let end_part = location.split('/').last().unwrap_or("New Tab");
+        heading = end_part.to_string();
+    }
+
     heading
 }
 
