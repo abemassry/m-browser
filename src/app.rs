@@ -313,6 +313,24 @@ impl App {
                                 if let Err(e) = back() {
                                     self.current_status = e.to_string();
                                 } else {
+                                    for tab in &mut self.tabs {
+                                        if tab.identifier == self.current_tab {
+                                            println!("inside if statement for back button of tab");
+                                            tab.forward.push(tab.location.clone());
+                                            tab.location = tab.back.pop().unwrap_or_else(|| tab.location.clone());
+                                            self.current_location = tab.location.clone();
+                                            self.current_page = go(tab.location.clone());
+                                            if is_wasm(self.current_location.clone()) {
+                                                println!("opening child window, back button");
+                                                self.spawn_child_window = true;
+                                            } else {
+                                                println!("Closing child window if open, back button");
+                                                self.close_child_window = true;
+                                            }
+                                            tab.contents = self.current_page.clone();
+                                            tab.label = get_heading(tab.location.clone(), tab.contents.clone());
+                                        }
+                                    }
                                     self.current_status = "Loaded".to_string();
                                 }
                             });
@@ -323,6 +341,24 @@ impl App {
                                 if let Err(e) = forward() {
                                     self.current_status = e.to_string();
                                 } else {
+                                    for tab in &mut self.tabs {
+                                        if tab.identifier == self.current_tab {
+                                            println!("inside if statement for forward button of tab");
+                                            tab.back.push(tab.location.clone());
+                                            tab.location = tab.forward.pop().unwrap_or_else(|| tab.location.clone());
+                                            self.current_location = tab.location.clone();
+                                            self.current_page = go(tab.location.clone());
+                                            if is_wasm(self.current_location.clone()) {
+                                                println!("opening child window, forward button");
+                                                self.spawn_child_window = true;
+                                            } else {
+                                                println!("Closing child window if open, forward button");
+                                                self.close_child_window = true;
+                                            }
+                                            tab.contents = self.current_page.clone();
+                                            tab.label = get_heading(tab.location.clone(), tab.contents.clone());
+                                        }
+                                    }
                                     self.current_status = "Loaded".to_string();
                                 }
                             });
@@ -363,8 +399,19 @@ impl App {
                                 if is_wasm(self.current_location.clone()) {
                                     self.spawn_child_window = true;
                                 } else {
-                                    println!("Closing child window if open, load");
+                                    println!("Closing child window if open, tab");
                                     self.close_child_window = true;
+                                    for tab in &mut self.tabs {
+                                        if tab.identifier == self.current_tab {
+                                            tab.back.push(tab.location.clone());
+                                            tab.forward.clear(); // clear forward history
+                                            tab.location = self.current_location.clone();
+                                            tab.contents = self.current_page.clone();
+                                            tab.label = get_heading(tab.location.clone(), tab.contents.clone());
+                                            break;
+                                        }
+                                    }
+
                                     self.current_status = "Loaded".to_string();
                                 }
                             });
@@ -418,7 +465,7 @@ impl App {
                         self.current_tab = self.tab_counter;
                         self.current_location = new_tab.location.clone();
                         self.current_page = new_tab.contents.clone();
-                        go(self.current_location.clone());
+
                     }
                 });
 
