@@ -315,6 +315,9 @@ impl App {
                                 } else {
                                     for tab in &mut self.tabs {
                                         if tab.identifier == self.current_tab {
+                                            if tab.back.is_empty() {
+                                                return;
+                                            }
                                             println!("inside if statement for back button of tab");
                                             tab.forward.push(tab.location.clone());
                                             tab.location = tab.back.pop().unwrap_or_else(|| tab.location.clone());
@@ -343,6 +346,9 @@ impl App {
                                 } else {
                                     for tab in &mut self.tabs {
                                         if tab.identifier == self.current_tab {
+                                            if tab.forward.is_empty() {
+                                                return;
+                                            }
                                             println!("inside if statement for forward button of tab");
                                             tab.back.push(tab.location.clone());
                                             tab.location = tab.forward.pop().unwrap_or_else(|| tab.location.clone());
