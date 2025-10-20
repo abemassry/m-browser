@@ -19,3 +19,7 @@ and combine it with the utility of the web that puts the power of the web back i
 [Link to second page in example](https://raw.githubusercontent.com/abemassry/m-browser/refs/heads/main/pages/SECOND_PAGE.md)
 
 [Link to wasm example](https://wsnd.io/ExZz2nOm/component.wasm)
+
+## Screenshots
+![screenshot of M Browser displaying markdown](./pages/screenshot_20251020.png)
+![screenshot of M Browser displaying wasm](./pages/screenshot_wasm_20251020.png)

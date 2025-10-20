@@ -332,6 +332,10 @@ impl App {
                                             }
                                             tab.contents = self.current_page.clone();
                                             tab.label = get_heading(tab.location.clone(), tab.contents.clone());
+                                            if let Some(window) = self.window.as_ref() {
+                                                let title = format!("M - {}", tab.label);
+                                                window.set_title(title.as_str());
+                                            }
                                         }
                                     }
                                     self.current_status = "Loaded".to_string();
@@ -363,6 +367,10 @@ impl App {
                                             }
                                             tab.contents = self.current_page.clone();
                                             tab.label = get_heading(tab.location.clone(), tab.contents.clone());
+                                            if let Some(window) = self.window.as_ref() {
+                                                let title = format!("M - {}", tab.label);
+                                                window.set_title(title.as_str());
+                                            }
                                         }
                                     }
                                     self.current_status = "Loaded".to_string();
@@ -387,6 +395,10 @@ impl App {
                                         tab.location = self.current_location.clone();
                                         tab.contents = self.current_page.clone();
                                         tab.label = get_heading(tab.location.clone(), tab.contents.clone());
+                                        if let Some(window) = self.window.as_ref() {
+                                            let title = format!("M - {}", tab.label);
+                                            window.set_title(title.as_str());
+                                        }
                                         break;
                                     }
                                 }
@@ -414,6 +426,10 @@ impl App {
                                             tab.location = self.current_location.clone();
                                             tab.contents = self.current_page.clone();
                                             tab.label = get_heading(tab.location.clone(), tab.contents.clone());
+                                            if let Some(window) = self.window.as_ref() {
+                                                let title = format!("M - {}", tab.label);
+                                                window.set_title(title.as_str());
+                                            }
                                             break;
                                         }
                                     }
@@ -451,6 +467,10 @@ impl App {
                             tab.location = self.current_location.clone();
                             tab.contents = self.current_page.clone();
                             tab.label = get_heading(tab.location.clone(), tab.contents.clone());
+                            if let Some(window) = self.window.as_ref() {
+                                let title = format!("M - {}", tab.label);
+                                window.set_title(title.as_str());
+                            }
 
                             self.current_status = "Loaded".to_string();
                         }
@@ -529,6 +549,10 @@ impl App {
                                             tab.location = self.current_location.clone();
                                             tab.contents = self.current_page.clone();
                                             tab.label = get_heading(tab.location.clone(), tab.contents.clone());
+                                            if let Some(window) = self.window.as_ref() {
+                                                let title = format!("M - {}", tab.label);
+                                                window.set_title(title.as_str());
+                                            }
                                         }
 
                                         self.current_status = "Loaded".to_string();
@@ -563,7 +587,7 @@ impl App {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = event_loop
-            .create_window(Window::default_attributes())
+            .create_window(Window::default_attributes().with_title("M"))
             .unwrap();
         pollster::block_on(self.set_window(window));
     }
