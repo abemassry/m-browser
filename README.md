@@ -21,5 +21,8 @@ and combine it with the utility of the web that puts the power of the web back i
 [Link to wasm example](https://wsnd.io/ExZz2nOm/component.wasm)
 
 ## Screenshots
+Example of markdown display:
 ![screenshot of M Browser displaying markdown](./pages/screenshot_20251020.png)
+
+Example of wasm display:
 ![screenshot of M Browser displaying wasm](./pages/screenshot_wasm_20251020.png)
