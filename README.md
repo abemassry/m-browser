@@ -26,3 +26,6 @@ Example of markdown display:
 
 Example of wasm display:
 ![screenshot of M Browser displaying wasm](https://raw.githubusercontent.com/abemassry/m-browser/refs/heads/main/pages/screenshot_wasm_20251020.png)
+
+Example of obligatory meta screenshot:
+![screenshot of M Browser displaying itself](https://raw.githubusercontent.com/abemassry/m-browser/refs/heads/main/pages/screenshot_meta_20251020.png)
