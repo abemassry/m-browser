@@ -22,7 +22,7 @@ and combine it with the utility of the web that puts the power of the web back i
 
 ## Screenshots
 Example of markdown display:
-![screenshot of M Browser displaying markdown](https://github.com/abemassry/m-browser/blob/44e61e95510848d657cfdcbaeb9e25ef33bb03e7/pages/screenshot_20251020.png)
+![screenshot of M Browser displaying markdown](./pages/screenshot_20251020.png)
 
 Example of wasm display:
-![screenshot of M Browser displaying wasm](https://github.com/abemassry/m-browser/blob/44e61e95510848d657cfdcbaeb9e25ef33bb03e7/pages/screenshot_wasm_20251020.png)
+![screenshot of M Browser displaying wasm](./pages/screenshot_wasm_20251020.png)
