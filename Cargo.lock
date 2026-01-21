@@ -2267,6 +2267,7 @@ dependencies = [
  "raw-window-handle",
  "reqwest",
  "softbuffer",
+ "system-interface",
  "tokio",
  "wasi-graphics-context-wasmtime",
  "wasi-surface-wasmtime",
