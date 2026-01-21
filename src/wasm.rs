@@ -7,7 +7,7 @@ use futures::executor::block_on;
 // use wasi_frame_buffer_wasmtime::WasiFrameBufferView;
 use wasi_graphics_context_wasmtime::WasiGraphicsContextView;
 use wasi_surface_wasmtime::{Surface, SurfaceDesc, WasiSurfaceView};
-use wasi_webgpu_wasmtime::WasiWebGpuView;
+use wasi_webgpu_wasmtime::{MainThreadSpawner, WasiWebGpuView};
 use wasi_webgpu_wasmtime::reexports::{wgpu_core, wgpu_types};
 
 use wasmtime::{
@@ -15,7 +15,7 @@ use wasmtime::{
     Config, Engine, Store,
 };
 
-use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_io::IoView;
 
 use winit::window::Window;
@@ -84,8 +84,11 @@ impl wasmtime::component::HasData for HostState {
 }
 
 impl WasiView for HostState {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.ctx
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
     }
 }
 
@@ -113,7 +116,7 @@ impl WasiWebGpuView for HostState {
         Arc::clone(&self.wgpu_instance)
     }
 
-    fn ui_thread_spawner(&self) -> Box<UiThreadSpawner> {
+    fn ui_thread_spawner(&self) -> Box<impl MainThreadSpawner> {
         println!("ui_thread_spawner");
         // todo!()
         Box::new(UiThreadSpawner)
