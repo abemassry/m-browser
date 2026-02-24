@@ -18,7 +18,7 @@ and combine it with the utility of the web that puts the power of the web back i
 
 [Link to second page in example](https://raw.githubusercontent.com/abemassry/m-browser/refs/heads/main/pages/SECOND_PAGE.md)
 
-[Link to wasm example](https://wsnd.io/ExZz2nOm/component.wasm)
+[Link to wasm example](https://wsnd.io/i0cyOnP4/basic_triangle.wasm)
 
 ## Screenshots
 Example of markdown display:
