@@ -25,16 +25,17 @@ image = { version = "0.25", default-features = false, features = [
     "webp",  # WebP support
     "tiff",  # TIFF support
 ]}
-wasi-graphics-context-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "5c0fc8bb2b597d477236beb00488755d1e94a02d" }
-wasi-surface-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "5c0fc8bb2b597d477236beb00488755d1e94a02d", features = ["winit"] }
-wasi-webgpu-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "5c0fc8bb2b597d477236beb00488755d1e94a02d" }
+wasi-graphics-context-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "8ddf03f08ae4cf5d11f4481a11a4d735187bf6f2" }
+wasi-surface-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "8ddf03f08ae4cf5d11f4481a11a4d735187bf6f2", features = ["winit"] }
+wasi-webgpu-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "8ddf03f08ae4cf5d11f4481a11a4d735187bf6f2" }
 
 
 
 
 
-wasmtime = { version = "31.0", features = ['component-model'] }
-wasmtime-wasi = "31.0"
+wasmtime = { version = "40.0", features = ['component-model'] }
+wasmtime-wasi = "40.0"
+wasmtime-wasi-io = "40.0"
 anyhow = "1.0"
 # winit = { version = "0.30", features = [ "android-native-activity" ] }
 wgpu-core = "24"
@@ -45,6 +46,7 @@ rand = "0.9"
 futures = "0.3"
 tokio = { version = "1.44", features = ["full"] }
 softbuffer = "0.4"
+system-interface = "0.27.3"
 env_logger = "0.11"
 log = "0.4"
 async-broadcast = "0.7"

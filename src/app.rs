@@ -4,8 +4,12 @@ use crate::winit_wasi::{MyWindowWrapper, WinitEventToSurfaceProxy};
 use egui_wgpu::wgpu::SurfaceError;
 use egui_wgpu::{wgpu, ScreenDescriptor};
 use std::sync::{Arc, Mutex};
+use std::fs;
+use std::fs::File;
+use std::io::{SeekFrom, Seek};
 use std::mem::{drop};
 use std::sync::mpsc;
+use system_interface::io::IoExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalSize, Position};
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -775,6 +779,13 @@ pub fn navigate(location: String) -> String {
         let wasm_file = download_wasm(location.clone());
         return wasm_file;
     }
+    if is_local_file(location.clone()) {
+        let mut f = File::open(location.replace("file://", "")).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let mut contents = String::new();
+        f.read_to_string(&mut contents).unwrap();
+        return contents;
+    }
     let resp = reqwest::blocking::get(location.clone())
         .and_then(|r| r.text())
         .map_err(|e| e.to_string());
@@ -785,6 +796,13 @@ pub fn navigate(location: String) -> String {
 }
 
 pub fn download_wasm(url: String) -> String {
+    if is_local_file(url.clone()) {
+        let wasm_path = url.replace("file://", "");
+        println!("url is local file with url: {}", url);
+        println!("Using local wasm file at {}", wasm_path);
+        fs::copy(&wasm_path, "downloaded.wasm").unwrap();
+        return wasm_path;
+    }
     let resp = reqwest::blocking::get(url.clone())
         .and_then(|r| r.bytes())
         .map_err(|e| e.to_string());
@@ -796,7 +814,6 @@ pub fn download_wasm(url: String) -> String {
         eprintln!("Failed to write wasm file to {}", wasm_path);
     });
     return wasm_path;
-
 }
 
 fn get_heading(location: String, contents: String) -> String {
@@ -831,6 +848,13 @@ fn get_heading(location: String, contents: String) -> String {
 
 fn is_wasm(filename: String) -> bool {
     if filename.ends_with(".wasm") {
+        return true;
+    }
+    false
+}
+
+fn is_local_file(path: String) -> bool {
+    if path.starts_with("file://") {
         return true;
     }
     false

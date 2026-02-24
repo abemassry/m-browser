@@ -7,13 +7,17 @@ use futures::executor::block_on;
 // use wasi_frame_buffer_wasmtime::WasiFrameBufferView;
 use wasi_graphics_context_wasmtime::WasiGraphicsContextView;
 use wasi_surface_wasmtime::{Surface, SurfaceDesc, WasiSurfaceView};
-use wasi_webgpu_wasmtime::WasiWebGpuView;
+use wasi_webgpu_wasmtime::{MainThreadSpawner, WasiWebGpuView};
+use wasi_webgpu_wasmtime::reexports::{wgpu_core, wgpu_types};
+
 use wasmtime::{
     component::{Component, Linker},
     Config, Engine, Store,
 };
 
-use wasmtime_wasi::{IoView, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi_io::IoView;
+
 use winit::window::Window;
 
 use crate::winit_wasi::MyWindowWrapper;
@@ -60,6 +64,7 @@ impl HostState {
                     backends: wgpu_types::Backends::all(),
                     flags: wgpu_types::InstanceFlags::from_build_config(),
                     backend_options: Default::default(),
+                    memory_budget_thresholds: Default::default(),
                 },
             )),
             // surface_proxy: None,
@@ -73,9 +78,17 @@ impl IoView for HostState {
         &mut self.table
     }
 }
+
+impl wasmtime::component::HasData for HostState {
+    type Data<'a> = &'a mut HostState;
+}
+
 impl WasiView for HostState {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.ctx
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
     }
 }
 
@@ -89,8 +102,8 @@ struct UiThreadSpawner;
 impl wasi_webgpu_wasmtime::MainThreadSpawner for UiThreadSpawner {
     async fn spawn<F, T>(&self, f: F) -> T
     where
-        F: FnOnce() -> T + Send + Sync + 'static,
-        T: Send + Sync + 'static,
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
     {
         // self.0.spawn(f).await
         println!("spawning");
@@ -103,7 +116,7 @@ impl WasiWebGpuView for HostState {
         Arc::clone(&self.wgpu_instance)
     }
 
-    fn ui_thread_spawner(&self) -> Box<UiThreadSpawner> {
+    fn ui_thread_spawner(&self) -> Box<impl MainThreadSpawner> {
         println!("ui_thread_spawner");
         // todo!()
         Box::new(UiThreadSpawner)
@@ -152,7 +165,7 @@ impl Wasm {
         // wasi_frame_buffer_wasmtime::add_to_linker(&mut linker)?;
         wasi_graphics_context_wasmtime::add_to_linker(&mut linker)?;
         wasi_surface_wasmtime::add_only_surface_to_linker(&mut linker)?;
-        wasmtime_wasi::add_to_linker_sync(&mut linker)?;
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
 
         // fn type_annotate<F>(val: F) -> F
         // where
@@ -214,7 +227,7 @@ impl Wasm {
 
 
         let instance =
-            wasmtime_wasi::bindings::Command::instantiate_async(&mut self.store, &component, &self.linker)
+            wasmtime_wasi::p2::bindings::Command::instantiate_async(&mut self.store, &component, &self.linker)
                 .await
                 .unwrap();
 
