@@ -6,7 +6,7 @@ use egui_wgpu::{wgpu, ScreenDescriptor};
 use std::sync::{Arc, Mutex};
 use std::fs;
 use std::fs::File;
-use std::io::{SeekFrom, Seek};
+use std::io::{Read as _, SeekFrom, Seek};
 use std::mem::{drop};
 use std::sync::mpsc;
 use system_interface::io::IoExt;
@@ -130,6 +130,8 @@ pub struct App {
     child_window: Option<Arc<Window>>,
     // wasi_surface: Option<wasi_surface_wasmtime::Surface>,
     wasi_event_handler: Option<WinitEventToSurfaceProxy>,
+    /// Keyboard/pointer events destined for the QEMU wasm module.
+    qemu_event_queue: Option<crate::qemu_gfx::GfxEventQueue>,
     parent_window_id: WindowId,
     child_window_id: WindowId,
     current_status: String,
@@ -160,6 +162,7 @@ impl App {
             child_window: None,
             // wasi_surface: None,
             wasi_event_handler: None,
+            qemu_event_queue: None,
             parent_window_id: 1.into(),
             child_window_id: 2.into(),
             current_status: "Loading...".to_string(),
@@ -596,7 +599,7 @@ impl ApplicationHandler for App {
         pollster::block_on(self.set_window(window));
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
         let close_child_window = self.close_child_window;
         if self.quit_pressed {
             println!("Quit pressed, exiting.");
@@ -611,6 +614,83 @@ impl ApplicationHandler for App {
 
         if let Some(wasi_event_handler) = &mut self.wasi_event_handler {
             wasi_event_handler.send_event(&event);
+        }
+
+        // Forward keyboard input to the QEMU wasm module.
+        //
+        // Routing deliberately does not key off the window id: the QEMU child
+        // window never takes keyboard focus, so winit reports every key
+        // against the parent window. Instead, send keys to QEMU whenever it is
+        // running and egui does not want them itself (i.e. no text field such
+        // as the URL bar is focused), so the browser chrome keeps working.
+        let egui_wants_keys = self
+            .state
+            .as_ref()
+            .map(|s| s.egui_renderer.context().wants_keyboard_input())
+            .unwrap_or(false);
+        let qemu_takes_keys = self.child_window.is_some() && !egui_wants_keys;
+
+
+        if qemu_takes_keys {
+            if let (Some(queue), WindowEvent::KeyboardInput { event: key, .. }) =
+                (&self.qemu_event_queue, &event)
+            {
+                let down = matches!(key.state, ElementState::Pressed);
+
+                if let PhysicalKey::Code(code) = key.physical_key {
+                    match crate::qemu_keymap::keycode_to_evdev(code) {
+                        Some(evdev) => {
+                            if let Ok(mut q) = queue.lock() {
+                                q.push(crate::qemu_gfx::InputEvent {
+                                    event_type: 3, // key, as an evdev code
+                                    code: evdev,
+                                    value: if down { 1 } else { 0 },
+                                });
+                            }
+                        }
+                        None => {
+                            eprintln!("[qemu-gfx] no evdev mapping for {code:?}, ignoring");
+                        }
+                    }
+
+                    // Printable characters need a second, text-carrying event.
+                    // QEMU's text consoles only translate a handful of
+                    // navigation keys from key codes (see qcode_to_keysym in
+                    // ui/console.c); everything else arrives as text. This
+                    // mirrors what ui/gtk.c does for its VTE consoles.
+                    //
+                    // Keys that the key-code path already handles are skipped
+                    // here so they are not delivered twice.
+                    let handled_as_qcode = matches!(
+                        code,
+                        KeyCode::Tab
+                            | KeyCode::Backspace
+                            | KeyCode::Delete
+                            | KeyCode::ArrowUp
+                            | KeyCode::ArrowDown
+                            | KeyCode::ArrowLeft
+                            | KeyCode::ArrowRight
+                            | KeyCode::Home
+                            | KeyCode::End
+                            | KeyCode::PageUp
+                            | KeyCode::PageDown
+                    );
+
+                    if down && !handled_as_qcode {
+                        if let Some(text) = key.logical_key.to_text() {
+                            if let Ok(mut q) = queue.lock() {
+                                for ch in text.chars() {
+                                    q.push(crate::qemu_gfx::InputEvent {
+                                        event_type: 5, // text, as a codepoint
+                                        code: ch as i32,
+                                        value: 0,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if self.spawn_child_window {
@@ -653,37 +733,126 @@ impl ApplicationHandler for App {
             self.wasi_event_handler = Some(WinitEventToSurfaceProxy::new(surface_proxy.clone()));
 
             let wasm_runtime_start = Arc::clone(&self.wasm_runtime);
-            std::thread::spawn(move || {
-                match wasm_runtime_start.lock() {
-                    Ok(mut guard) => {
-                        match pollster::block_on(guard.run_wasm("downloaded.wasm".to_string(), surface)) {
-                            Ok(_) => println!("Wasm ran successfully"),
-                            Err(e) => println!("Error running wasm: {e}"),
-                        }
-                    },
+
+            // Resolve the actual wasm file path.
+            // For file:// URLs, use the original file directly (download_wasm
+            // may have failed to copy it properly, especially for large binaries).
+            // For remote URLs, use the downloaded copy.
+            let wasm_path = if self.current_location.starts_with("file://") {
+                self.current_location.replace("file://", "")
+            } else {
+                "downloaded.wasm".to_string()
+            };
+            eprintln!("[detect] wasm_path={wasm_path}, exists={}", std::path::Path::new(&wasm_path).exists());
+
+            // Detect whether the wasm file is a core module or a component.
+            // Core modules: magic \0asm + version 0x01000000
+            // Components:   magic \0asm + version 0x0d000100
+            let is_core_module = {
+                let mut header = [0u8; 8];
+                match File::open(&wasm_path).and_then(|mut f| f.read_exact(&mut header)) {
+                    Ok(()) => {
+                        // Core module version bytes: [01, 00, 00, 00]
+                        let is_core = header[4] == 0x01 && header[5] == 0x00 && header[6] == 0x00 && header[7] == 0x00;
+                        eprintln!("[detect] wasm header bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} => is_core={is_core}",
+                            header[0], header[1], header[2], header[3],
+                            header[4], header[5], header[6], header[7]);
+                        is_core
+                    }
                     Err(e) => {
-                        println!("Failed to lock wasm runtime mutex: {e}");
+                        eprintln!("[detect] Failed to read wasm header from '{}': {e}", wasm_path);
+                        false // fall through to component path which will report the error
                     }
                 }
-                // pollster::block_on(wasm_runtime.lock().unwrap().run_wasm("breakout.wasm".to_string(), surface)).unwrap();
-            });
+            };
 
+            if is_core_module {
+                // Core module path — used for QEMU wasm binary
+                // Pass the surface for graphical display via host_gfx_* functions
+                println!("Detected core wasm module, using WASIp1 + JIT + GFX path");
 
-            std::thread::spawn(move || {
-                loop {
-                    if event_receiver.lock().expect("REASON").try_recv().is_ok() {
-                        println!("Close child window signal received in thread.");
-                        break;
+                let gfx_event_queue = crate::qemu_gfx::new_event_queue();
+                self.qemu_event_queue = Some(gfx_event_queue.clone());
+
+                std::thread::spawn(move || {
+                let args: Vec<&str> = vec![
+                    "qemu-system-x86_64",
+                    "-L", "/bios",
+                    "-drive", "file=/data/m.qcow2,format=qcow2",
+                    "-m", "128",
+                    "-accel", "tcg,tb-size=16",
+                    // Give QEMU a text console: its own monitor plus the guest
+                    // serial port, drawn with the built-in VGA font. The wasm
+                    // display backend prefers a text console over the graphic
+                    // one, so this is what appears in the window.
+                    "-monitor", "vc",
+                    "-serial", "vc",
+                ];
+                    // Use local paths within m-browser directory
+                    let preopen_dirs: Vec<(&str, &str)> = vec![
+                        ("pc-bios", "/bios"),
+                        (".", "/data"),
+                    ];
+                    match crate::wasm::run_wasm_module(
+                        &wasm_path,
+                        &args,
+                        &preopen_dirs,
+                        Some(surface),
+                        gfx_event_queue,
+                    ) {
+                        Ok(_) => println!("QEMU core module ran successfully"),
+                        Err(e) => eprintln!("Error running QEMU core module: {e:?}"),
                     }
-                    surface_proxy.animation_frame();
-                    std::thread::sleep(std::time::Duration::from_millis(16));
-                    //if received.is_ok() {
-                    //    println!("Received quit signal in child window thread.");
-                    //    pollster::block_on(wasm_runtime_events.lock().unwrap().stop_wasm()).unwrap();
-                    //    break;
-                    //}
-                }
-            });
+                });
+
+                // Start animation frame / surface proxy thread for the core module too
+                // so that the surface receives redraw ticks.
+                std::thread::spawn(move || {
+                    loop {
+                        if event_receiver.lock().expect("REASON").try_recv().is_ok() {
+                            println!("Close child window signal received in thread.");
+                            break;
+                        }
+                        // Catch panics from animation_frame() — the surface channel
+                        // may close if the QEMU thread exits or crashes.
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            surface_proxy.animation_frame();
+                        }))
+                        .is_err()
+                        {
+                            eprintln!("[qemu-gfx] animation_frame channel closed, stopping proxy thread");
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(16));
+                    }
+                });
+            } else {
+                // Component path — existing behavior for wasi-gfx components
+                std::thread::spawn(move || {
+                    match wasm_runtime_start.lock() {
+                        Ok(mut guard) => {
+                            match pollster::block_on(guard.run_wasm(wasm_path, surface)) {
+                                Ok(_) => println!("Wasm ran successfully"),
+                                Err(e) => println!("Error running wasm: {e}"),
+                            }
+                        },
+                        Err(e) => {
+                            println!("Failed to lock wasm runtime mutex: {e}");
+                        }
+                    }
+                });
+
+                std::thread::spawn(move || {
+                    loop {
+                        if event_receiver.lock().expect("REASON").try_recv().is_ok() {
+                            println!("Close child window signal received in thread.");
+                            break;
+                        }
+                        surface_proxy.animation_frame();
+                        std::thread::sleep(std::time::Duration::from_millis(16));
+                    }
+                });
+            }
 
             let child_id = self.child_window.as_ref().unwrap().id();
             println!("Child window created with id: {child_id:?}");
@@ -800,7 +969,15 @@ pub fn download_wasm(url: String) -> String {
         let wasm_path = url.replace("file://", "");
         println!("url is local file with url: {}", url);
         println!("Using local wasm file at {}", wasm_path);
-        fs::copy(&wasm_path, "downloaded.wasm").unwrap();
+        // Skip copy if source and destination resolve to the same file
+        let dest = "downloaded.wasm";
+        let src_canonical = std::fs::canonicalize(&wasm_path).ok();
+        let dst_canonical = std::fs::canonicalize(dest).ok();
+        if src_canonical.is_some() && src_canonical == dst_canonical {
+            println!("Source and destination are the same file, skipping copy");
+        } else {
+            fs::copy(&wasm_path, dest).unwrap();
+        }
         return wasm_path;
     }
     let resp = reqwest::blocking::get(url.clone())
