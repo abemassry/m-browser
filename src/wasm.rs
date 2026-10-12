@@ -308,6 +308,10 @@ pub fn run_wasm_module(
     // `None` to dramatically reduce per-TB compile latency. The QEMU module
     // itself only compiles once at startup so this trade-off is fine.
     config.cranelift_opt_level(wasmtime::OptLevel::None);
+    // Experiment: QEMU_WASM_OPT=speed compiles everything optimized.
+    if std::env::var("QEMU_WASM_OPT").as_deref() == Ok("speed") {
+        config.cranelift_opt_level(wasmtime::OptLevel::Speed);
+    }
     let engine = Engine::new(&config)?;
     println!("[qemu] [{:>7.3}s] Engine created", t0.elapsed().as_secs_f64());
 
@@ -363,9 +367,11 @@ pub fn run_wasm_module(
         gfx: gfx_state,
         guest_memory: None,
         pending_exception: false,
+        limits: qemu_jit::qemu_store_limits(),
     };
 
     let mut store = Store::new(&engine, host_state);
+    store.limiter(|s| &mut s.limits);
 
     // Load the core module
     println!("[qemu] [{:>7.3}s] Loading module from: {wasm_path}", t0.elapsed().as_secs_f64());
@@ -425,13 +431,30 @@ pub fn run_wasm_module(
     Ok(())
 }
 
-/// Number of TB module instances to allow in one Store before moving QEMU
-/// into a fresh one. Wasmtime frees instances only when their Store is
-/// dropped; by default a Store may hold 10,000 instances, and every compiled
-/// TB also holds executable mappings counted against vm.max_map_count
-/// (usually 65,530). A single main-loop step can compile up to ~1,000 new
-/// TBs, so this leaves headroom below both limits.
-const MIGRATE_AFTER_INSTANCES: u32 = 7000;
+/// When to move QEMU into a fresh Store (see `migrate_store`).
+///
+/// Wasmtime frees TB module instances only when their Store is dropped, and
+/// an instance keeps its compiled module, with that module's executable
+/// memory mappings, alive even after the module has left the module cache.
+/// Linux limits a process to vm.max_map_count mappings (65,530 by default);
+/// going over makes the next mapping fail and the process abort. So the
+/// mapping count itself decides: it is sampled every
+/// `MAP_CHECK_INTERVAL` new instances, and a move is made above
+/// `MAP_COUNT_SOFT_LIMIT`. One main-loop step creates at most about 1,000
+/// instances (~2,000 mappings), well within the remaining headroom.
+/// `MIGRATE_AFTER_INSTANCES` bounds the instance count as well: most instances
+/// reuse a cached module and add no mappings, but each still holds about
+/// 0.4 KB, and every move costs a pause (copying QEMU's memory, ~0.5 s) plus
+/// re-instantiating the TBs in use, so moves should not be too frequent.
+const MIGRATE_AFTER_INSTANCES: u32 = 100_000;
+const MAP_CHECK_INTERVAL: u32 = 512;
+const MAP_COUNT_SOFT_LIMIT: usize = 45_000;
+
+/// Number of memory mappings of this process, if the OS reports it.
+pub fn process_map_count() -> Option<usize> {
+    let maps = std::fs::read("/proc/self/maps").ok()?;
+    Some(maps.iter().filter(|&&b| b == b'\n').count())
+}
 
 /// Drive a QEMU build linked as a WASI reactor: `_initialize`, then
 /// `wasi_qemu_init`, then `wasi_qemu_step` until it returns an exit status.
@@ -462,6 +485,7 @@ fn run_qemu_reactor(
     println!("[qemu] [{:>7.3}s] Running", t0.elapsed().as_secs_f64());
 
     let mut step = instance.get_typed_func::<(), i32>(&mut store, "wasi_qemu_step")?;
+    let mut next_map_check = MAP_CHECK_INTERVAL;
     loop {
         let status = match step.call(&mut store, ()) {
             Ok(status) => status,
@@ -480,11 +504,30 @@ fn run_qemu_reactor(
             return Ok(());
         }
 
-        if store.data().jit.instances_in_store >= MIGRATE_AFTER_INSTANCES {
+        let instances = store.data().jit.instances_in_store;
+        let mut migrate = instances >= MIGRATE_AFTER_INSTANCES;
+        if !migrate && instances >= next_map_check {
+            next_map_check = instances + MAP_CHECK_INTERVAL;
+            migrate = process_map_count().is_some_and(|n| n > MAP_COUNT_SOFT_LIMIT);
+        }
+        if migrate {
+            next_map_check = MAP_CHECK_INTERVAL;
             let (new_store, new_instance) = migrate_store(store, instance, linker, module)?;
             store = new_store;
             instance = new_instance;
             step = instance.get_typed_func::<(), i32>(&mut store, "wasi_qemu_step")?;
+
+            // The cached modules are what remains mapped now. If they alone
+            // use most of the budget, moves would repeat constantly: trim.
+            if process_map_count().is_some_and(|n| n > MAP_COUNT_SOFT_LIMIT * 2 / 3) {
+                let jit = &mut store.data_mut().jit;
+                let keep = jit.module_cache_len() / 2;
+                jit.shrink_module_cache(keep);
+                eprintln!(
+                    "[qemu-jit] module cache trimmed to {keep} modules; {} memory mappings",
+                    process_map_count().unwrap_or(0)
+                );
+            }
         }
     }
 }
@@ -509,7 +552,18 @@ pub fn migrate_store(
     let memory = instance
         .get_memory(&mut store, "memory")
         .context("QEMU module has no memory export")?;
-    let image: Vec<u8> = memory.data(&store).to_vec();
+    // Memory grown beyond the module's initial size starts out zeroed, so
+    // only its non-zero parts need copying; skipping guest RAM that was never
+    // used saves time and keeps the new store's resident size down. The
+    // initial memory holds the data segments, which instantiation has just
+    // re-initialised, so that part is always copied in full.
+    let initial = match module.get_export("memory") {
+        Some(wasmtime::ExternType::Memory(m)) => (m.minimum() as usize).saturating_mul(65536),
+        _ => usize::MAX,
+    };
+    let image = nonzero_runs(memory.data(&store), initial);
+    let image_len = memory.data_size(&store);
+    let copied: usize = image.iter().map(|(_, run)| run.len()).sum();
     let freed = store.data().jit.instances_in_store;
 
     // Dropping the old Store here is what actually frees the TB instances.
@@ -519,6 +573,7 @@ pub fn migrate_store(
     state.pending_exception = false;
 
     let mut store = Store::new(module.engine(), state);
+    store.limiter(|s| &mut s.limits);
     let instance = linker
         .instantiate(&mut store, module)
         .context("re-instantiating QEMU in a fresh store")?;
@@ -526,11 +581,15 @@ pub fn migrate_store(
         .get_memory(&mut store, "memory")
         .context("QEMU module has no memory export")?;
     let have = memory.data_size(&store);
-    if image.len() > have {
-        let pages = ((image.len() - have) as u64).div_ceil(65536);
+    if image_len > have {
+        let pages = ((image_len - have) as u64).div_ceil(65536);
         memory.grow(&mut store, pages).context("growing memory in the fresh store")?;
     }
-    memory.data_mut(&mut store)[..image.len()].copy_from_slice(&image);
+    let data = memory.data_mut(&mut store);
+    for (offset, run) in &image {
+        data[*offset..*offset + run.len()].copy_from_slice(run);
+    }
+    drop(image);
     store.data_mut().guest_memory = Some(memory);
 
     instance
@@ -539,10 +598,66 @@ pub fn migrate_store(
         .context("wasi_qemu_jit_reset failed")?;
 
     eprintln!(
-        "[qemu] moved QEMU to a fresh store: {} MiB copied, {} TB modules freed, {:.0} ms",
-        image.len() >> 20,
+        "[qemu] moved QEMU to a fresh store: {} of {} MiB copied, {} TB modules freed, {:.0} ms",
+        copied >> 20,
+        image_len >> 20,
         freed,
         started.elapsed().as_secs_f64() * 1e3
     );
+    {
+        let jit = &store.data().jit;
+        // Each compiled module holds executable mappings, which count
+        // against vm.max_map_count (usually 65530), so keep an eye on them.
+        let maps = process_map_count().map_or_else(|| "?".into(), |n| n.to_string());
+        eprintln!(
+            "[qemu-jit] compiled {} TBs in {:.1} s total, {} reused from cache; {} memory mappings",
+            jit.stats_compiled,
+            jit.stats_compile_time.as_secs_f64(),
+            jit.stats_cache_hits,
+            maps
+        );
+        let labels = ["<512B", "<1K", "<2K", "<4K", ">=4K"];
+        let parts: Vec<String> = jit
+            .stats_by_size
+            .iter()
+            .zip(labels)
+            .filter(|((n, _, _), _)| *n > 0)
+            .map(|((n, t, b), l)| {
+                format!("{l}: {n} x {:.2} ms avg {} B", t.as_secs_f64() * 1e3 / *n as f64, b / n)
+            })
+            .collect();
+        if std::env::var_os("QEMU_JIT_STATS").is_some() {
+            eprintln!("[qemu-jit] compile cost by size: {}", parts.join(", "));
+        }
+    }
     Ok((store, instance))
+}
+
+/// The parts of `data` to copy into a fresh instance's memory, as
+/// (offset, bytes) runs of whole 64 KiB chunks: everything below
+/// `dense_below`, and above it the chunks that are not all zeros.
+fn nonzero_runs(data: &[u8], dense_below: usize) -> Vec<(usize, Vec<u8>)> {
+    const CHUNK: usize = 64 * 1024;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (i, chunk) in data.chunks(CHUNK).enumerate() {
+        let (start, end) = (i * CHUNK, i * CHUNK + chunk.len());
+        if start >= dense_below {
+            // SAFETY: any bit pattern is a valid u64.
+            let (head, words, tail) = unsafe { chunk.align_to::<u64>() };
+            let zero = head.iter().all(|&b| b == 0)
+                && words.iter().fold(0, |acc, &w| acc | w) == 0
+                && tail.iter().all(|&b| b == 0);
+            if zero {
+                continue;
+            }
+        }
+        match ranges.last_mut() {
+            Some((_, last_end)) if *last_end == start => *last_end = end,
+            _ => ranges.push((start, end)),
+        }
+    }
+    ranges
+        .into_iter()
+        .map(|(start, end)| (start, data[start..end].to_vec()))
+        .collect()
 }

@@ -630,6 +630,61 @@ impl ApplicationHandler for App {
             .unwrap_or(false);
         let qemu_takes_keys = self.child_window.is_some() && !egui_wants_keys;
 
+        // Forward the mouse to QEMU while the pointer is over its window.
+        // Positions are in window pixels, i.e. in the frame as displayed;
+        // the guest side maps them to its absolute pointing device
+        // (QEMU's usb-tablet). Button codes are QEMU's InputButton values.
+        if window_id == self.child_window_id {
+            if let Some(queue) = &self.qemu_event_queue {
+                let mut events: Vec<(i32, i32, i32)> = Vec::new();
+                match &event {
+                    WindowEvent::CursorMoved { position, .. } => {
+                        events.push((1, 0, position.x as i32));
+                        events.push((1, 1, position.y as i32));
+                    }
+                    WindowEvent::MouseInput { state, button, .. } => {
+                        let code = match button {
+                            winit::event::MouseButton::Left => Some(0),
+                            winit::event::MouseButton::Middle => Some(1),
+                            winit::event::MouseButton::Right => Some(2),
+                            winit::event::MouseButton::Back => Some(5),
+                            winit::event::MouseButton::Forward => Some(6),
+                            winit::event::MouseButton::Other(_) => None,
+                        };
+                        if let Some(code) = code {
+                            let down = matches!(state, ElementState::Pressed);
+                            events.push((2, code, down as i32));
+                        }
+                    }
+                    WindowEvent::MouseWheel { delta, .. } => {
+                        let dy = match delta {
+                            winit::event::MouseScrollDelta::LineDelta(_, y) => *y,
+                            winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                        };
+                        // A wheel step is a press and release of wheel-up (3)
+                        // or wheel-down (4).
+                        if dy != 0.0 {
+                            let code = if dy > 0.0 { 3 } else { 4 };
+                            events.push((2, code, 1));
+                            events.push((2, code, 0));
+                        }
+                    }
+                    _ => {}
+                }
+                if !events.is_empty() {
+                    if let Ok(mut q) = queue.lock() {
+                        for (event_type, code, value) in events {
+                            q.push(crate::qemu_gfx::InputEvent {
+                                event_type,
+                                code,
+                                value,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
 
         if qemu_takes_keys {
             if let (Some(queue), WindowEvent::KeyboardInput { event: key, .. }) =
@@ -779,12 +834,25 @@ impl ApplicationHandler for App {
                     "qemu-system-x86_64",
                     "-L", "/bios",
                     "-drive", "file=/data/m.qcow2,format=qcow2",
-                    "-m", "128",
-                    "-accel", "tcg,tb-size=16",
-                    // Give QEMU a text console: its own monitor plus the guest
-                    // serial port, drawn with the built-in VGA font. The wasm
-                    // display backend prefers a text console over the graphic
-                    // one, so this is what appears in the window.
+                    // With QEMU's default of 128 MiB the guest's X desktop
+                    // swaps constantly: everything crawls, and X stalls long
+                    // enough for the guest kernel to drop keystrokes.
+                    "-m", "512",
+                    // 256 MiB of translated code. When the buffer fills up,
+                    // QEMU discards all translations and has to translate
+                    // (and the host recompile) its working set again; with
+                    // 64 MiB that happened every few seconds while the
+                    // desktop started, and it reached the desktop a minute
+                    // later. Costs ~400 MiB more host memory.
+                    "-accel", "tcg,tb-size=256",
+                    // A USB tablet reports absolute positions, so the guest
+                    // pointer follows the host pointer exactly (needed for
+                    // X). XHCI rather than UHCI: no 1 kHz polling timer.
+                    "-device", "qemu-xhci",
+                    "-device", "usb-tablet",
+                    // The window shows the guest's screen. These add QEMU's
+                    // monitor (Ctrl+Alt+2) and the guest's serial port
+                    // (Ctrl+Alt+3) as text consoles; Ctrl+Alt+1 switches back.
                     "-monitor", "vc",
                     "-serial", "vc",
                 ];
