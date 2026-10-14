@@ -4,6 +4,7 @@ mod headless;
 mod qemu_gfx;
 mod qemu_jit;
 mod qemu_keymap;
+mod qemu_net;
 mod wasm;
 mod winit_wasi;
 

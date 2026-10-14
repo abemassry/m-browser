@@ -2416,12 +2416,14 @@ dependencies = [
  "futures",
  "image",
  "log",
+ "mio",
  "oneshot",
  "pollster",
  "pulldown-cmark 0.13.0",
  "rand 0.9.2",
  "raw-window-handle",
  "reqwest",
+ "socket2",
  "softbuffer",
  "system-interface",
  "tokio",
@@ -2550,6 +2552,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]

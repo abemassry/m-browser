@@ -22,6 +22,8 @@
 //!                             (see mkfifo), followed by Enter; lines starting
 //!                             with `!` are pointer commands (`!move X Y`,
 //!                             `!click BUTTON`; see `pointer_command`)
+//!   QEMU_QUIT_AFTER=<secs>    ask QEMU to quit after this long, as the GUI
+//!                             does when its window closes
 
 use anyhow::{bail, Context, Result};
 use std::time::Duration;
@@ -71,8 +73,23 @@ pub fn run(args: &[String]) -> Result<()> {
         spawn_fifo_typist(path.into(), queue.clone());
     }
 
+    let stop = match std::env::var("QEMU_QUIT_AFTER") {
+        Ok(secs) => {
+            let secs: f64 = secs.parse().context("QEMU_QUIT_AFTER must be a number of seconds")?;
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs_f64(secs));
+                eprintln!("[headless] QEMU_QUIT_AFTER: asking QEMU to quit");
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            Some(stop)
+        }
+        Err(_) => None,
+    };
+
     eprintln!("[headless] running {wasm_path} with args {:?}", &argv[1..]);
-    crate::wasm::run_wasm_module(wasm_path, &argv, &preopen_refs, None, queue)
+    crate::wasm::run_wasm_module(wasm_path, &argv, &preopen_refs, None, queue, stop)
 }
 
 /// Linux evdev code for a character on a US keyboard, and whether it needs

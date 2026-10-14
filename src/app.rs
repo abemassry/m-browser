@@ -3,6 +3,7 @@ use crate::wasm::Wasm;
 use crate::winit_wasi::{MyWindowWrapper, WinitEventToSurfaceProxy};
 use egui_wgpu::wgpu::SurfaceError;
 use egui_wgpu::{wgpu, ScreenDescriptor};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::fs;
 use std::fs::File;
@@ -123,6 +124,39 @@ impl AppState {
     }
 }
 
+/// A QEMU core module running on its own thread.
+struct QemuRun {
+    /// Set to make QEMU quit; see `wasm::run_wasm_module`.
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// The disk image the browser's QEMU boots, relative to the working directory
+/// (QEMU sees it as /data/m.qcow2).
+const QEMU_DISK_IMAGE: &str = "m.qcow2";
+
+/// Lock `path` for as long as the returned file stays open, so that no other
+/// QEMU started by an m-browser writes the same disk image at the same time:
+/// two writers corrupt a qcow2 image, and QEMU on WASI cannot lock files
+/// itself. Fails if the image is locked already.
+fn lock_disk_image(path: &str) -> Result<Option<File>, String> {
+    let file = match fs::OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        // Let QEMU report a missing or unreadable image.
+        Err(_) => return Ok(None),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Err(format!(
+            "{path} is in use by another QEMU; not starting a second one on the same disk image"
+        )),
+        Err(fs::TryLockError::Error(e)) => {
+            eprintln!("Cannot lock {path} ({e}); starting QEMU anyway");
+            Ok(None)
+        }
+    }
+}
+
 pub struct App {
     instance: wgpu::Instance,
     state: Option<AppState>,
@@ -132,6 +166,8 @@ pub struct App {
     wasi_event_handler: Option<WinitEventToSurfaceProxy>,
     /// Keyboard/pointer events destined for the QEMU wasm module.
     qemu_event_queue: Option<crate::qemu_gfx::GfxEventQueue>,
+    /// The QEMU started by loading a core wasm module, while it runs.
+    qemu: Option<QemuRun>,
     parent_window_id: WindowId,
     child_window_id: WindowId,
     current_status: String,
@@ -151,6 +187,24 @@ pub struct App {
 }
 
 impl App {
+    /// Ask the running QEMU, if any, to quit. Returns its thread, which ends
+    /// once QEMU has closed its disk images.
+    fn stop_qemu(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        let qemu = self.qemu.take()?;
+        qemu.stop.store(true, Ordering::Relaxed);
+        Some(qemu.thread)
+    }
+
+    /// Stop QEMU before the browser exits, giving it a few seconds to close
+    /// its disk images so that they stay consistent.
+    fn shutdown_qemu(&mut self) {
+        if let Some(thread) = self.stop_qemu() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !thread.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
     pub fn new() -> Self {
         let instance = egui_wgpu::wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let (tx, rx) = mpsc::channel();
@@ -163,6 +217,7 @@ impl App {
             // wasi_surface: None,
             wasi_event_handler: None,
             qemu_event_queue: None,
+            qemu: None,
             parent_window_id: 1.into(),
             child_window_id: 2.into(),
             current_status: "Loading...".to_string(),
@@ -603,6 +658,7 @@ impl ApplicationHandler for App {
         let close_child_window = self.close_child_window;
         if self.quit_pressed {
             println!("Quit pressed, exiting.");
+            self.shutdown_qemu();
             event_loop.exit();
         }
         // let egui render to process the event first
@@ -612,8 +668,23 @@ impl ApplicationHandler for App {
             .egui_renderer
             .handle_input(self.window.as_ref().unwrap(), &event);
 
+        // Once QEMU has exited (e.g. it could not open its disk image), its
+        // surface is gone: stop sending it events.
+        if self.qemu.as_ref().is_some_and(|q| q.thread.is_finished()) {
+            self.qemu = None;
+            self.qemu_event_queue = None;
+            self.wasi_event_handler = None;
+        }
+
         if let Some(wasi_event_handler) = &mut self.wasi_event_handler {
-            wasi_event_handler.send_event(&event);
+            // Sending panics once the wasm module has exited and dropped its
+            // surface: stop forwarding then, rather than take the browser down.
+            let sent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                wasi_event_handler.send_event(&event)
+            }));
+            if sent.is_err() {
+                self.wasi_event_handler = None;
+            }
         }
 
         // Forward keyboard input to the QEMU wasm module.
@@ -829,7 +900,24 @@ impl ApplicationHandler for App {
                 let gfx_event_queue = crate::qemu_gfx::new_event_queue();
                 self.qemu_event_queue = Some(gfx_event_queue.clone());
 
-                std::thread::spawn(move || {
+                // Loading QEMU again replaces the running one, which must
+                // first close the disk image the new one is about to open.
+                let previous_qemu = self.stop_qemu();
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop_qemu = stop.clone();
+
+                let thread = std::thread::spawn(move || {
+                    if let Some(previous) = previous_qemu {
+                        println!("Waiting for the previous QEMU to quit");
+                        let _ = previous.join();
+                    }
+                    let _image_lock = match lock_disk_image(QEMU_DISK_IMAGE) {
+                        Ok(lock) => lock,
+                        Err(message) => {
+                            eprintln!("{message}");
+                            return;
+                        }
+                    };
                 let args: Vec<&str> = vec![
                     "qemu-system-x86_64",
                     "-L", "/bios",
@@ -855,6 +943,9 @@ impl ApplicationHandler for App {
                     // (Ctrl+Alt+3) as text consoles; Ctrl+Alt+1 switches back.
                     "-monitor", "vc",
                     "-serial", "vc",
+                    // User-mode networking, provided by m-browser (see
+                    // qemu_net.rs): DHCP, DNS, pings and UDP for now.
+                    "-nic", "user",
                 ];
                     // Use local paths within m-browser directory
                     let preopen_dirs: Vec<(&str, &str)> = vec![
@@ -867,11 +958,13 @@ impl ApplicationHandler for App {
                         &preopen_dirs,
                         Some(surface),
                         gfx_event_queue,
+                        Some(stop_qemu),
                     ) {
                         Ok(_) => println!("QEMU core module ran successfully"),
                         Err(e) => eprintln!("Error running QEMU core module: {e:?}"),
                     }
                 });
+                self.qemu = Some(QemuRun { stop, thread });
 
                 // Start animation frame / surface proxy thread for the core module too
                 // so that the surface receives redraw ticks.
@@ -936,6 +1029,8 @@ impl ApplicationHandler for App {
                 //pollster::block_on(wasm_runtime_events.lock().expect("REASON").stop_wasm()).unwrap();
                 self.event_sender.as_ref().unwrap().send(()).unwrap();
                 self.sender.as_ref().unwrap().send(()).unwrap();
+                // QEMU finishes quitting on its own thread.
+                drop(self.stop_qemu());
                 println!("Closing child window.");
                 self.child_window_id = 2.into(); // hide child window
                 self.child_window.clone().expect("REASON").set_visible(false);
@@ -953,6 +1048,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 println!("The close button was pressed; stopping");
+                self.shutdown_qemu();
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {

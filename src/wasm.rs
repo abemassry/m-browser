@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::error::Error as StdError;
@@ -279,12 +280,14 @@ impl Wasm {
 ///                  (e.g. [("/home/user/vm", "/")] so the guest can access disk images)
 /// `surface`    — optional wasi_surface for display output (None = headless / -nographic)
 /// `event_queue` — shared event queue for injecting input events from the main thread
+/// `stop`       — when set, QEMU quits cleanly and this returns (QEMU reactor builds)
 pub fn run_wasm_module(
     wasm_path: &str,
     qemu_args: &[&str],
     preopen_dirs: &[(&str, &str)],
     surface: Option<wasi_surface_wasmtime::Surface>,
     event_queue: qemu_gfx::GfxEventQueue,
+    stop: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<()> {
     use qemu_jit::{QemuHostState, QemuJitState};
     use std::time::Instant;
@@ -326,6 +329,10 @@ pub fn run_wasm_module(
 
     // Add QEMU GFX imports (env::host_gfx_init, host_gfx_update_framebuffer, host_gfx_resize, host_gfx_poll_events)
     qemu_gfx::add_gfx_to_linker(&mut linker, event_queue)?;
+
+    // Add QEMU's user network (env::host_net_send, host_net_recv), which
+    // gives the guest DHCP, DNS, pings and UDP through host sockets.
+    crate::qemu_net::add_net_to_linker(&mut linker)?;
     println!("[qemu] [{:>7.3}s] Linker configured", t0.elapsed().as_secs_f64());
 
     // Build WASI context
@@ -401,7 +408,7 @@ pub fn run_wasm_module(
     // Reactor builds (wasi_qemu_init/wasi_qemu_step exports) are driven one
     // main-loop iteration at a time; see run_qemu_reactor.
     if instance.get_func(&mut store, "wasi_qemu_step").is_some() {
-        return run_qemu_reactor(store, instance, &linker, &module, t0);
+        return run_qemu_reactor(store, instance, &linker, &module, t0, stop);
     }
 
     // Get and call _start
@@ -456,18 +463,25 @@ pub fn process_map_count() -> Option<usize> {
     Some(maps.iter().filter(|&&b| b == b'\n').count())
 }
 
+/// How long QEMU gets to shut down once asked to quit.
+const QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Drive a QEMU build linked as a WASI reactor: `_initialize`, then
 /// `wasi_qemu_init`, then `wasi_qemu_step` until it returns an exit status.
 ///
 /// Because control returns here between main-loop iterations, no wasm frames
 /// are live, which makes it safe to move QEMU into a new Store whenever the
 /// per-TB JIT instances pile up (see `migrate_store`).
+///
+/// Setting `stop` makes QEMU quit: it powers the guest off and closes its
+/// disk images, then this returns.
 fn run_qemu_reactor(
     mut store: Store<qemu_jit::QemuHostState>,
     mut instance: wasmtime::Instance,
     linker: &wasmtime::Linker<qemu_jit::QemuHostState>,
     module: &wasmtime::Module,
     t0: std::time::Instant,
+    stop: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<()> {
     println!("[qemu] [{:>7.3}s] Initializing (reactor)...", t0.elapsed().as_secs_f64());
     instance
@@ -475,10 +489,21 @@ fn run_qemu_reactor(
         .context("reactor module has no _initialize export")?
         .call(&mut store, ())
         .context("QEMU _initialize failed")?;
-    let rc = instance
+    let init = instance
         .get_typed_func::<(), i32>(&mut store, "wasi_qemu_init")?
-        .call(&mut store, ())
-        .context("QEMU init failed")?;
+        .call(&mut store, ());
+    let rc = match init {
+        Ok(rc) => rc,
+        // QEMU calls exit() when it cannot start, e.g. over a bad option or a
+        // disk image it cannot open, after printing why.
+        Err(e) => match e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+            Some(exit) => anyhow::bail!(
+                "QEMU exited during startup with status {} (its error message is above)",
+                exit.0
+            ),
+            None => return Err(e).context("QEMU init failed"),
+        },
+    };
     if rc != 0 {
         anyhow::bail!("wasi_qemu_init returned {rc}");
     }
@@ -486,7 +511,29 @@ fn run_qemu_reactor(
 
     let mut step = instance.get_typed_func::<(), i32>(&mut store, "wasi_qemu_step")?;
     let mut next_map_check = MAP_CHECK_INTERVAL;
+    // Set once QEMU has been asked to quit, with the time it has to do so.
+    let mut quit_deadline: Option<std::time::Instant> = None;
     loop {
+        if quit_deadline.is_none() && stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) {
+            // Let QEMU power the guest off and close its disk images, so
+            // they stay consistent, before the instance is dropped.
+            match instance.get_typed_func::<(), ()>(&mut store, "wasi_qemu_quit") {
+                Ok(quit) => {
+                    println!("[qemu] asking QEMU to quit");
+                    quit.call(&mut store, ()).context("wasi_qemu_quit failed")?;
+                    quit_deadline = Some(std::time::Instant::now() + QUIT_TIMEOUT);
+                }
+                Err(_) => {
+                    println!("[qemu] stopped (this QEMU build cannot quit cleanly)");
+                    return Ok(());
+                }
+            }
+        }
+        if quit_deadline.is_some_and(|d| std::time::Instant::now() > d) {
+            eprintln!("[qemu] QEMU did not quit within {QUIT_TIMEOUT:?}; stopping it");
+            return Ok(());
+        }
+
         let status = match step.call(&mut store, ()) {
             Ok(status) => status,
             Err(e) => {

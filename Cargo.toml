@@ -45,6 +45,9 @@ async-trait = "0.1"
 rand = "0.9"
 futures = "0.3"
 tokio = { version = "1.44", features = ["full"] }
+# QEMU's user network (qemu_net.rs): host sockets, including ICMP "ping" sockets
+mio = { version = "1", features = ["os-poll", "net"] }
+socket2 = "0.6"
 softbuffer = "0.4"
 system-interface = "0.27.3"
 env_logger = "0.11"
