@@ -187,9 +187,10 @@ pub struct App {
 }
 
 impl App {
-    /// Ask the running QEMU, if any, to quit. Returns its thread, which ends
-    /// once QEMU has closed its disk images.
+    /// Ask the running QEMU, if any, to quit, and stop queueing input for it.
+    /// Returns its thread, which ends once QEMU has closed its disk images.
     fn stop_qemu(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        self.qemu_event_queue = None;
         let qemu = self.qemu.take()?;
         qemu.stop.store(true, Ordering::Relaxed);
         Some(qemu.thread)
@@ -668,17 +669,18 @@ impl ApplicationHandler for App {
             .egui_renderer
             .handle_input(self.window.as_ref().unwrap(), &event);
 
-        // Once QEMU has exited (e.g. it could not open its disk image), its
-        // surface is gone: stop sending it events.
+        // Once QEMU has exited (e.g. it could not open its disk image), stop
+        // queueing input for it.
         if self.qemu.as_ref().is_some_and(|q| q.thread.is_finished()) {
             self.qemu = None;
             self.qemu_event_queue = None;
-            self.wasi_event_handler = None;
         }
 
         if let Some(wasi_event_handler) = &mut self.wasi_event_handler {
-            // Sending panics once the wasm module has exited and dropped its
-            // surface: stop forwarding then, rather than take the browser down.
+            // Sending panics once a wasi-gfx component has exited and dropped
+            // its surface: stop forwarding then, rather than take the browser
+            // down. (QEMU takes no events from its surface; see where it is
+            // started.)
             let sent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 wasi_event_handler.send_event(&event)
             }));
@@ -821,6 +823,10 @@ impl ApplicationHandler for App {
 
         if self.spawn_child_window {
             self.spawn_child_window = false;
+            // The new page replaces QEMU, if it is running: ask it to quit.
+            // It finishes on its own thread; a new QEMU waits for that before
+            // opening the same disk image.
+            let previous_qemu = self.stop_qemu();
             if self.child_window.is_some() {
                 println!("About to stop wasm using wasm_runtime_events from new spawn");
                 //pollster::block_on(wasm_runtime_events.lock().expect("REASON").stop_wasm()).unwrap();
@@ -854,9 +860,6 @@ impl ApplicationHandler for App {
             // self.wasi_surface = Some(wasi_surface_wasmtime::Surface::new(Box::new(MyWindowWrapper(child_window))));
 
             let surface = wasi_surface_wasmtime::Surface::new(Box::new(MyWindowWrapper(child_window)));
-
-            let surface_proxy: wasi_surface_wasmtime::SurfaceProxy = surface.proxy();
-            self.wasi_event_handler = Some(WinitEventToSurfaceProxy::new(surface_proxy.clone()));
 
             let wasm_runtime_start = Arc::clone(&self.wasm_runtime);
 
@@ -900,13 +903,12 @@ impl ApplicationHandler for App {
                 let gfx_event_queue = crate::qemu_gfx::new_event_queue();
                 self.qemu_event_queue = Some(gfx_event_queue.clone());
 
-                // Loading QEMU again replaces the running one, which must
-                // first close the disk image the new one is about to open.
-                let previous_qemu = self.stop_qemu();
                 let stop = Arc::new(AtomicBool::new(false));
                 let stop_qemu = stop.clone();
 
                 let thread = std::thread::spawn(move || {
+                    // A QEMU this one replaces must first close the disk
+                    // image this one is about to open.
                     if let Some(previous) = previous_qemu {
                         println!("Waiting for the previous QEMU to quit");
                         let _ = previous.join();
@@ -966,29 +968,18 @@ impl ApplicationHandler for App {
                 });
                 self.qemu = Some(QemuRun { stop, thread });
 
-                // Start animation frame / surface proxy thread for the core module too
-                // so that the surface receives redraw ticks.
-                std::thread::spawn(move || {
-                    loop {
-                        if event_receiver.lock().expect("REASON").try_recv().is_ok() {
-                            println!("Close child window signal received in thread.");
-                            break;
-                        }
-                        // Catch panics from animation_frame() — the surface channel
-                        // may close if the QEMU thread exits or crashes.
-                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            surface_proxy.animation_frame();
-                        }))
-                        .is_err()
-                        {
-                            eprintln!("[qemu-gfx] animation_frame channel closed, stopping proxy thread");
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(16));
-                    }
-                });
+                // Unlike a wasi-gfx component, QEMU takes no events from its
+                // surface: input reaches it through qemu_event_queue (see
+                // window_event), and it needs no animation frames. So nothing
+                // sends to the surface here. That matters when QEMU exits:
+                // dropping the surface closes its event channels, and
+                // wasi-gfx-runtime panics on a send to a closed channel.
             } else {
-                // Component path — existing behavior for wasi-gfx components
+                // Component path: wasi-gfx components take their input and
+                // animation frames from the surface.
+                let surface_proxy: wasi_surface_wasmtime::SurfaceProxy = surface.proxy();
+                self.wasi_event_handler = Some(WinitEventToSurfaceProxy::new(surface_proxy.clone()));
+
                 std::thread::spawn(move || {
                     match wasm_runtime_start.lock() {
                         Ok(mut guard) => {
