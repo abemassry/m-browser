@@ -920,6 +920,10 @@ impl ApplicationHandler for App {
                             return;
                         }
                     };
+                    // QEMU_NIC replaces the network option below, e.g. to
+                    // forward a host port into the guest:
+                    // QEMU_NIC=user,hostfwd=tcp:127.0.0.1:2222-:22
+                    let nic = std::env::var("QEMU_NIC").unwrap_or_else(|_| "user".into());
                 let args: Vec<&str> = vec![
                     "qemu-system-x86_64",
                     "-L", "/bios",
@@ -946,8 +950,9 @@ impl ApplicationHandler for App {
                     "-monitor", "vc",
                     "-serial", "vc",
                     // User-mode networking, provided by m-browser (see
-                    // qemu_net.rs): DHCP, DNS, pings and UDP for now.
-                    "-nic", "user",
+                    // qemu_net.rs): the guest gets 10.0.2.15 by DHCP, and its
+                    // TCP, UDP and pings go out through host sockets.
+                    "-nic", &nic,
                 ];
                     // Use local paths within m-browser directory
                     let preopen_dirs: Vec<(&str, &str)> = vec![

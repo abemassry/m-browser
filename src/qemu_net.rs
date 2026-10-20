@@ -12,18 +12,24 @@
 //! | 10.0.2.2  | gateway; its ports are the host's own 127.0.0.1 ports |
 //! | 10.0.2.3  | DNS server, forwarding to the host's resolver         |
 //!
-//! What works so far:
+//! What it does:
 //! - ARP for 10.0.2.2 and 10.0.2.3, and DHCP.
+//! - TCP, relayed through host TCP sockets (see the `tcp` module), and port
+//!   forwarding from the host into the guest (QEMU's hostfwd option).
+//! - UDP, including DNS, relayed through host UDP sockets.
 //! - Pings. 10.0.2.2 and 10.0.2.3 answer directly; other addresses are
 //!   pinged from the host with an unprivileged ICMP socket. Linux allows
 //!   those only if the user's group is in net.ipv4.ping_group_range, as for
 //!   the ping command.
-//! - UDP, including DNS, relayed through host UDP sockets.
-//! - TCP is not relayed yet. Connection attempts are refused at once (with a
-//!   reset), so programs fail fast instead of waiting for a timeout.
+//! - IP fragmentation, both ways.
+//!
+//! There is no IPv6: the guest only has a link-local IPv6 address, so its
+//! programs use IPv4.
 //!
 //! Frames are handled on a thread of their own, so that waiting on host
 //! sockets never holds up the emulation.
+
+mod tcp;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -70,9 +76,9 @@ const IP_UDP: u8 = 17;
 
 const WAKE: Token = Token(0);
 
-/// Add QEMU's user network imports, `env.host_net_send`, `host_net_recv` and
-/// `host_net_wait` (see net/wasi-user.c.inc in QEMU), backed by a new network
-/// that lives as long as the linker.
+/// Add QEMU's user network imports, `env.host_net_send`, `host_net_recv`,
+/// `host_net_wait` and `host_net_hostfwd` (see net/wasi-user.c.inc in QEMU),
+/// backed by a new network that lives as long as the linker.
 pub fn add_net_to_linker(linker: &mut Linker<QemuHostState>) -> anyhow::Result<()> {
     let net = Arc::new(VirtualNet::start()?);
 
@@ -122,9 +128,37 @@ pub fn add_net_to_linker(linker: &mut Linker<QemuHostState>) -> anyhow::Result<(
     )?;
 
     // QEMU sleeps in this while the guest is idle (see wasi_idle_wait).
+    let n = net.clone();
     linker.func_wrap("env", "host_net_wait", move |timeout_ns: i64| {
-        net.wait_for_frame(Duration::from_nanos(timeout_ns.max(0) as u64));
+        n.wait_for_frame(Duration::from_nanos(timeout_ns.max(0) as u64));
     })?;
+
+    // A port forwarding rule from QEMU's command line (hostfwd=...).
+    // Returns 0, or -1 after printing why the rule cannot be used.
+    linker.func_wrap(
+        "env",
+        "host_net_hostfwd",
+        move |mut caller: Caller<'_, QemuHostState>, ptr: u32, len: u32| -> i32 {
+            let Some(memory) = guest_memory(&mut caller) else {
+                return -1;
+            };
+            let start = ptr as usize;
+            let Some(bytes) = memory.data(&caller).get(start..start.saturating_add(len as usize)) else {
+                return -1;
+            };
+            let rule = String::from_utf8_lossy(bytes).into_owned();
+            match net.add_forward(&rule) {
+                Ok((host, guest)) => {
+                    eprintln!("[qemu-net] forwarding {host} to the guest's {guest}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("[qemu-net] hostfwd={rule}: {e}");
+                    -1
+                }
+            }
+        },
+    )?;
     Ok(())
 }
 
@@ -148,6 +182,11 @@ struct Shared {
     to_guest_len: AtomicUsize,
     /// Signalled when a frame is added to `to_guest`, for `host_net_wait`.
     to_guest_ready: Condvar,
+    /// Set by the network thread when `to_guest` was too full to take all
+    /// it had: QEMU then wakes it once the guest has taken enough frames.
+    wake_when_drained: AtomicBool,
+    /// Port forwards set up by QEMU, for the network thread to take on.
+    new_forwards: Mutex<Vec<(mio::net::TcpListener, SocketAddrV4)>>,
     waker: Waker,
     stop: AtomicBool,
 }
@@ -166,6 +205,8 @@ impl VirtualNet {
             to_guest: Mutex::new(VecDeque::new()),
             to_guest_len: AtomicUsize::new(0),
             to_guest_ready: Condvar::new(),
+            wake_when_drained: AtomicBool::new(false),
+            new_forwards: Mutex::new(Vec::new()),
             waker: Waker::new(poll.registry(), WAKE)?,
             stop: AtomicBool::new(false),
         });
@@ -201,7 +242,24 @@ impl VirtualNet {
         let mut queue = self.shared.to_guest.lock().unwrap();
         let frame = queue.pop_front();
         self.shared.to_guest_len.store(queue.len(), Ordering::Release);
+        if queue.len() < QUEUE_MAX / 2 && self.shared.wake_when_drained.swap(false, Ordering::AcqRel) {
+            let _ = self.shared.waker.wake();
+        }
         frame
+    }
+
+    /// Set up a port forward for a QEMU hostfwd rule. Returns the host
+    /// address listened on, and the guest address forwarded to.
+    fn add_forward(&self, rule: &str) -> Result<(SocketAddr, SocketAddrV4), String> {
+        let (host, guest) = tcp::parse_hostfwd(rule)?;
+        let listener =
+            std::net::TcpListener::bind(host).map_err(|e| format!("cannot listen on {host}: {e}"))?;
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let bound = listener.local_addr().map_err(|e| e.to_string())?;
+        let listener = mio::net::TcpListener::from_std(listener);
+        self.shared.new_forwards.lock().unwrap().push((listener, guest));
+        let _ = self.shared.waker.wake();
+        Ok((bound, guest))
     }
 
     /// Sleep for up to `timeout`, or until there is a frame for the guest.
@@ -296,14 +354,15 @@ struct Stack {
     ip_id: u16,
     /// The host's DNS server, from /etc/resolv.conf.
     nameserver: Option<SocketAddr>,
+    tcp: tcp::TcpNat,
     /// QEMU_NET_DEBUG=1 logs every packet handled.
     debug: bool,
     warned_ping: bool,
-    warned_tcp: bool,
 }
 
 impl Stack {
     fn new(shared: Arc<Shared>, registry: Registry) -> Self {
+        let debug = std::env::var_os("QEMU_NET_DEBUG").is_some();
         Self {
             shared,
             registry,
@@ -316,9 +375,9 @@ impl Stack {
             guest_mac: None,
             ip_id: 0,
             nameserver: host_nameserver(),
-            debug: std::env::var_os("QEMU_NET_DEBUG").is_some(),
+            tcp: tcp::TcpNat::new(debug),
+            debug,
             warned_ping: false,
-            warned_tcp: false,
         }
     }
 
@@ -331,10 +390,19 @@ impl Stack {
     fn run(mut self, mut poll: Poll) {
         let mut events = Events::with_capacity(64);
         while !self.shared.stop.load(Ordering::Relaxed) {
-            // Wake up now and then to close idle sockets and drop stale
-            // fragments, if there are any.
+            // Wake up for TCP's timers, and now and then to close idle sockets
+            // and drop stale fragments, if there are any.
             let busy = !self.sockets.is_empty() || !self.fragments.is_empty();
-            let timeout = busy.then_some(Duration::from_secs(5));
+            let mut timeout = busy.then_some(Duration::from_secs(5));
+            if let Some(tcp) = self.tcp.poll_delay() {
+                timeout = Some(timeout.map_or(tcp, |t| t.min(tcp)));
+            }
+            if self.tcp.starved() {
+                // TCP has packets the guest's queue could not take, and wants
+                // to run at once; QEMU wakes this thread once there is room
+                // (see wake_when_drained). Meanwhile, retry now and then.
+                timeout = Some(Duration::from_millis(20));
+            }
             if let Err(e) = poll.poll(&mut events, timeout) {
                 if e.kind() == ErrorKind::Interrupted {
                     continue;
@@ -343,14 +411,25 @@ impl Stack {
                 return;
             }
             for event in events.iter() {
-                if event.token() != WAKE {
-                    self.socket_readable(event.token());
+                match event.token() {
+                    WAKE => {}
+                    token if self.sockets.contains_key(&token) => self.socket_readable(token),
+                    _ => {
+                        if let Some(failed) = self.tcp.host_event(event, &self.registry, &mut self.next_token) {
+                            self.tcp_failed(&failed);
+                        }
+                    }
                 }
+            }
+            let forwards = std::mem::take(&mut *self.shared.new_forwards.lock().unwrap());
+            for (listener, guest) in forwards {
+                self.tcp.add_forward(listener, guest, &self.registry, &mut self.next_token);
             }
             let frames = std::mem::take(&mut *self.shared.from_guest.lock().unwrap());
             for frame in &frames {
                 self.guest_frame(frame);
             }
+            self.service_tcp();
             if self.last_sweep.elapsed() >= Duration::from_secs(1) {
                 self.last_sweep = Instant::now();
                 self.close_idle_sockets();
@@ -552,16 +631,65 @@ impl Stack {
         }
     }
 
-    /// TCP is not relayed yet: refuse every connection with a reset, as a
-    /// host with nothing listening on the port would.
     fn tcp(&mut self, packet: &Packet) {
+        let p = packet.payload();
+        if p.len() < 20 || !is_unicast(packet.dst) {
+            return;
+        }
+        let flow = tcp::Flow {
+            guest: SocketAddrV4::new(packet.src, u16::from_be_bytes([p[0], p[1]])),
+            remote: SocketAddrV4::new(packet.dst, u16::from_be_bytes([p[2], p[3]])),
+        };
+        let host = self.host_address(flow.remote);
+        match self.tcp.from_guest(packet.bytes, flow, p[13], host, &self.registry, &mut self.next_token) {
+            tcp::Verdict::Done => {}
+            tcp::Verdict::Reset => self.send_tcp_reset(packet),
+            tcp::Verdict::Unreachable => self.send_unreachable(packet, 1),
+        }
+    }
+
+    /// The host side of a guest's connection attempt failed: tell the guest,
+    /// as a host on a real network would.
+    fn tcp_failed(&mut self, failed: &tcp::Failed) {
+        let syn = &failed.syn;
+        if syn.len() < 20 {
+            return;
+        }
+        let packet = Packet {
+            src: ipv4(&syn[12..16]),
+            dst: ipv4(&syn[16..20]),
+            bytes: syn,
+            header_len: (syn[0] & 0x0f) as usize * 4,
+        };
+        if failed.refused {
+            self.send_tcp_reset(&packet);
+        } else {
+            self.send_unreachable(&packet, 1);
+        }
+    }
+
+    /// Run TCP, and pass the packets it produced to the guest.
+    fn service_tcp(&mut self) {
+        let queued = self.shared.to_guest_len.load(Ordering::Acquire);
+        self.tcp.service(QUEUE_MAX.saturating_sub(queued), &self.registry);
+        for packet in self.tcp.take_packets() {
+            self.send_ip_packet(packet);
+        }
+        if self.tcp.starved() {
+            self.shared.wake_when_drained.store(true, Ordering::Release);
+        }
+    }
+
+    /// Answer a TCP segment with a reset, as a host with nothing listening
+    /// on the port would.
+    fn send_tcp_reset(&mut self, packet: &Packet) {
         const FIN: u8 = 0x01;
         const SYN: u8 = 0x02;
         const RST: u8 = 0x04;
         const ACK: u8 = 0x10;
 
         let p = packet.payload();
-        if p.len() < 20 || !is_unicast(packet.dst) {
+        if p.len() < 20 {
             return;
         }
         let flags = p[13];
@@ -571,14 +699,6 @@ impl Stack {
         }
         if flags & SYN != 0 {
             let port = u16::from_be_bytes([p[2], p[3]]);
-            if !self.warned_tcp {
-                self.warned_tcp = true;
-                eprintln!(
-                    "[qemu-net] TCP is not supported yet: refusing connections \
-                     (first one to {}:{port})",
-                    packet.dst
-                );
-            }
             self.log(format_args!("TCP connection to {}:{port} refused", packet.dst));
         }
         // RFC 793: a reset acknowledges what the segment occupied, or
@@ -852,6 +972,19 @@ impl Stack {
         }
     }
 
+    /// Send a complete IPv4 packet (from the TCP stack) to the guest.
+    fn send_ip_packet(&self, packet: Vec<u8>) {
+        let Some(mac) = self.guest_mac else {
+            return;
+        };
+        let mut frame = Vec::with_capacity(14 + packet.len());
+        frame.extend_from_slice(&mac);
+        frame.extend_from_slice(&GATEWAY_MAC);
+        frame.extend_from_slice(&ETH_IPV4.to_be_bytes());
+        frame.extend_from_slice(&packet);
+        self.send_frame(frame);
+    }
+
     fn send_ipv4(&mut self, src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, payload: &[u8]) {
         let Some(mac) = self.guest_mac else {
             return;
@@ -1068,6 +1201,8 @@ mod tests {
             to_guest: Mutex::new(VecDeque::new()),
             to_guest_len: AtomicUsize::new(0),
             to_guest_ready: Condvar::new(),
+            wake_when_drained: AtomicBool::new(false),
+            new_forwards: Mutex::new(Vec::new()),
             waker: Waker::new(poll.registry(), WAKE).unwrap(),
             stop: AtomicBool::new(false),
         });
@@ -1149,5 +1284,425 @@ mod tests {
         let found = dhcp_options(&opts);
         assert_eq!(found, vec![(53, &[3u8][..]), (50, &[10u8, 0, 2, 15][..])]);
         assert_eq!(dhcp_options(&[54, 4, 10, 0]), vec![]);
+    }
+
+    // ----- TCP, end to end: a guest made of smoltcp talks through a running
+    // VirtualNet to real sockets on the host's loopback interface -----------
+
+    use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+    use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
+    use smoltcp::socket::tcp as stcp;
+    use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
+    use std::io::{Read, Write};
+
+    const TEST_GUEST_MAC: [u8; 6] = [0x52, 0x54, 0, 0x12, 0x34, 0x56];
+
+    /// The guest's network card: Ethernet frames to and from a VirtualNet,
+    /// IP packets for smoltcp.
+    struct GuestNic<'a>(&'a VirtualNet);
+    struct GuestRx(Vec<u8>);
+    struct GuestTx<'a>(&'a VirtualNet);
+
+    impl phy::RxToken for GuestRx {
+        fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+            f(&self.0[14..])
+        }
+    }
+
+    impl phy::TxToken for GuestTx<'_> {
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+            let mut frame = vec![0; 14 + len];
+            frame[..6].copy_from_slice(&GATEWAY_MAC);
+            frame[6..12].copy_from_slice(&TEST_GUEST_MAC);
+            frame[12..14].copy_from_slice(&ETH_IPV4.to_be_bytes());
+            let result = f(&mut frame[14..]);
+            self.0.from_guest(&frame);
+            result
+        }
+    }
+
+    impl Device for GuestNic<'_> {
+        type RxToken<'a> = GuestRx where Self: 'a;
+        type TxToken<'a> = GuestTx<'a> where Self: 'a;
+
+        fn receive(&mut self, _now: smoltcp::time::Instant) -> Option<(GuestRx, GuestTx<'_>)> {
+            loop {
+                let frame = self.0.to_guest()?;
+                if frame.len() > 14 && frame[12..14] == ETH_IPV4.to_be_bytes() {
+                    return Some((GuestRx(frame), GuestTx(self.0)));
+                }
+            }
+        }
+
+        fn transmit(&mut self, _now: smoltcp::time::Instant) -> Option<GuestTx<'_>> {
+            Some(GuestTx(self.0))
+        }
+
+        fn capabilities(&self) -> DeviceCapabilities {
+            let mut caps = DeviceCapabilities::default();
+            caps.medium = Medium::Ip;
+            caps.max_transmission_unit = MTU;
+            caps
+        }
+    }
+
+    struct TestGuest {
+        net: VirtualNet,
+        iface: Interface,
+        sockets: SocketSet<'static>,
+    }
+
+    impl TestGuest {
+        fn new() -> Self {
+            let net = VirtualNet::start().unwrap();
+            let mut config = Config::new(HardwareAddress::Ip);
+            config.random_seed = 7;
+            let mut iface = Interface::new(config, &mut GuestNic(&net), smoltcp::time::Instant::now());
+            iface.update_ip_addrs(|addrs| addrs.push(IpCidr::new(IpAddress::Ipv4(GUEST_IP), 24)).unwrap());
+            iface.routes_mut().add_default_ipv4_route(GATEWAY_IP).unwrap();
+            Self {
+                net,
+                iface,
+                sockets: SocketSet::new(Vec::new()),
+            }
+        }
+
+        fn socket(&mut self, rx: usize, tx: usize) -> SocketHandle {
+            self.sockets.add(stcp::Socket::new(
+                stcp::SocketBuffer::new(vec![0; rx]),
+                stcp::SocketBuffer::new(vec![0; tx]),
+            ))
+        }
+
+        fn tcp(&mut self, handle: SocketHandle) -> &mut stcp::Socket<'static> {
+            self.sockets.get_mut(handle)
+        }
+
+        fn connect(&mut self, handle: SocketHandle, remote: SocketAddrV4, local_port: u16) {
+            let cx = self.iface.context();
+            self.sockets.get_mut::<stcp::Socket>(handle).connect(cx, remote, local_port).unwrap();
+        }
+
+        /// Send a frame so that the network learns the guest's MAC address,
+        /// as DHCP would: an ARP request for the gateway.
+        fn announce(&self) {
+            let mut frame = vec![0xff; 6];
+            frame.extend_from_slice(&TEST_GUEST_MAC);
+            frame.extend_from_slice(&ETH_ARP.to_be_bytes());
+            frame.extend_from_slice(&[0, 1, 8, 0, 6, 4, 0, 1]);
+            frame.extend_from_slice(&TEST_GUEST_MAC);
+            frame.extend_from_slice(&GUEST_IP.octets());
+            frame.extend_from_slice(&[0; 6]);
+            frame.extend_from_slice(&GATEWAY_IP.octets());
+            self.net.from_guest(&frame);
+        }
+
+        /// Run the guest's stack until `done` returns true (then returns
+        /// true), or until `timeout` passes.
+        fn run(&mut self, timeout: Duration, mut done: impl FnMut(&mut Self) -> bool) -> bool {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                self.iface
+                    .poll(smoltcp::time::Instant::now(), &mut GuestNic(&self.net), &mut self.sockets);
+                if done(self) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            false
+        }
+    }
+
+    fn pattern(len: usize, seed: u32) -> Vec<u8> {
+        (0..len as u32).map(|i| (i.wrapping_mul(2654435761) >> 13 ^ seed) as u8).collect()
+    }
+
+    /// A megabyte to a host echo server and back, then a close from the
+    /// guest that the host sees.
+    #[test]
+    fn tcp_relays_both_ways() {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let echo = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            let mut buf = vec![0; 65536];
+            let mut total = 0;
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    return total;
+                }
+                stream.write_all(&buf[..n]).unwrap();
+                total += n;
+            }
+        });
+
+        let mut g = TestGuest::new();
+        let h = g.socket(64 * 1024, 64 * 1024);
+        g.connect(h, SocketAddrV4::new(GATEWAY_IP, port), 40000);
+        let data = pattern(1_000_000, 1);
+        let (mut sent, mut received) = (0, Vec::new());
+        let finished = g.run(Duration::from_secs(60), |g| {
+            let s = g.tcp(h);
+            if s.can_send() && sent < data.len() {
+                sent += s.send_slice(&data[sent..]).unwrap();
+            }
+            if s.can_recv() {
+                s.recv(|b| {
+                    received.extend_from_slice(b);
+                    (b.len(), ())
+                })
+                .unwrap();
+            }
+            if received.len() == data.len() {
+                s.close();
+            }
+            matches!(s.state(), stcp::State::TimeWait | stcp::State::Closed)
+        });
+        assert!(finished, "timed out: sent {sent}, received {}", received.len());
+        assert!(received == data, "echoed data differs");
+        assert_eq!(echo.join().unwrap(), data.len());
+    }
+
+    /// A connection to a closed port is refused with a reset.
+    #[test]
+    fn tcp_refused_connection_is_reset() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut g = TestGuest::new();
+        let h = g.socket(4096, 4096);
+        g.connect(h, SocketAddrV4::new(GATEWAY_IP, port), 40001);
+        let mut established = false;
+        let closed = g.run(Duration::from_secs(10), |g| {
+            let s = g.tcp(h);
+            established |= s.state() == stcp::State::Established;
+            s.state() == stcp::State::Closed
+        });
+        assert!(closed && !established);
+    }
+
+    /// The host sends and closes first; the guest, reading slowly through a
+    /// small window, gets everything and the FIN, then answers and closes.
+    #[test]
+    fn tcp_half_close_from_the_host() {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let data = pattern(300_000, 2);
+        let to_send = data.clone();
+        let host = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            stream.write_all(&to_send).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut answer = Vec::new();
+            stream.read_to_end(&mut answer).unwrap();
+            answer
+        });
+
+        let mut g = TestGuest::new();
+        let h = g.socket(2048, 4096);
+        g.connect(h, SocketAddrV4::new(GATEWAY_IP, port), 40002);
+        let mut received = Vec::new();
+        let mut answered = false;
+        let finished = g.run(Duration::from_secs(60), |g| {
+            let s = g.tcp(h);
+            if s.can_recv() {
+                s.recv(|b| {
+                    let n = b.len().min(512);
+                    received.extend_from_slice(&b[..n]);
+                    (n, ())
+                })
+                .unwrap();
+            }
+            if !answered && s.state() == stcp::State::CloseWait && !s.can_recv() {
+                s.send_slice(b"bye").unwrap();
+                s.close();
+                answered = true;
+            }
+            answered && s.state() == stcp::State::Closed
+        });
+        assert!(finished, "timed out after receiving {} bytes", received.len());
+        assert!(received == data, "received data differs");
+        assert_eq!(host.join().unwrap(), b"bye");
+    }
+
+    /// Many connections to the same host port at once each get their own
+    /// host connection.
+    #[test]
+    fn tcp_parallel_connections() {
+        const N: usize = 20;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let host = std::thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for _ in 0..N {
+                let (mut stream, _) = server.accept().unwrap();
+                handlers.push(std::thread::spawn(move || {
+                    let mut message = Vec::new();
+                    stream.read_to_end(&mut message).unwrap();
+                    message.reverse();
+                    stream.write_all(&message).unwrap();
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+
+        let mut g = TestGuest::new();
+        let handles: Vec<SocketHandle> = (0..N)
+            .map(|i| {
+                let h = g.socket(4096, 4096);
+                g.connect(h, SocketAddrV4::new(GATEWAY_IP, port), 41000 + i as u16);
+                h
+            })
+            .collect();
+        let mut replies = vec![Vec::new(); N];
+        let mut sent = vec![false; N];
+        let finished = g.run(Duration::from_secs(30), |g| {
+            let mut all_closed = true;
+            for (i, &h) in handles.iter().enumerate() {
+                let s = g.tcp(h);
+                if !sent[i] && s.can_send() {
+                    s.send_slice(format!("message {i}").as_bytes()).unwrap();
+                    s.close();
+                    sent[i] = true;
+                }
+                if s.can_recv() {
+                    s.recv(|b| {
+                        replies[i].extend_from_slice(b);
+                        (b.len(), ())
+                    })
+                    .unwrap();
+                }
+                all_closed &= matches!(s.state(), stcp::State::TimeWait | stcp::State::Closed);
+            }
+            all_closed
+        });
+        assert!(finished, "timed out");
+        for (i, reply) in replies.iter().enumerate() {
+            let mut expected = format!("message {i}").into_bytes();
+            expected.reverse();
+            assert_eq!(reply, &expected, "connection {i}");
+        }
+        host.join().unwrap();
+    }
+
+    /// hostfwd: a host connection to the forwarded port reaches the guest.
+    #[test]
+    fn tcp_port_forward_into_the_guest() {
+        let mut g = TestGuest::new();
+        let (host_addr, guest_addr) = g.net.add_forward("tcp:127.0.0.1:0-:2222").unwrap();
+        assert_eq!(guest_addr, SocketAddrV4::new(GUEST_IP, 2222));
+        g.announce();
+        let h = g.socket(4096, 4096);
+        g.tcp(h).listen(2222).unwrap();
+
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(host_addr).unwrap();
+            stream.write_all(b"hello guest").unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut answer = String::new();
+            stream.read_to_string(&mut answer).unwrap();
+            answer
+        });
+        let mut request = Vec::new();
+        let mut answered = false;
+        let finished = g.run(Duration::from_secs(20), |g| {
+            let s = g.tcp(h);
+            if s.can_recv() {
+                s.recv(|b| {
+                    request.extend_from_slice(b);
+                    (b.len(), ())
+                })
+                .unwrap();
+            }
+            if !answered && s.state() == stcp::State::CloseWait && !s.can_recv() {
+                s.send_slice(&request.to_ascii_uppercase()).unwrap();
+                s.close();
+                answered = true;
+            }
+            answered && s.state() == stcp::State::Closed
+        });
+        assert!(finished, "timed out; the guest received {:?}", String::from_utf8_lossy(&request));
+        assert_eq!(client.join().unwrap(), "HELLO GUEST");
+    }
+
+    /// Run `body` on a thread of its own, failing if it takes longer than
+    /// `timeout`: a network thread stuck in a loop would otherwise hang the
+    /// test, as dropping the network waits for its thread.
+    fn within(timeout: Duration, body: impl FnOnce() + Send + 'static) {
+        use std::sync::mpsc::RecvTimeoutError;
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            body();
+            let _ = done.send(());
+        });
+        match finished.recv_timeout(timeout) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) => panic!("timed out after {timeout:?}"),
+            Err(RecvTimeoutError::Disconnected) => panic!("failed (see above)"),
+        }
+    }
+
+    /// The host resets a connection while the guest is still sending: the
+    /// guest's connection is reset too, and the network carries on.
+    #[test]
+    fn tcp_host_reset_while_guest_sends() {
+        within(Duration::from_secs(60), || {
+            let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = server.local_addr().unwrap().port();
+            let host = std::thread::spawn(move || {
+                let (mut stream, _) = server.accept().unwrap();
+                let mut start = [0; 1000];
+                stream.read_exact(&mut start).unwrap();
+                // Close with a reset (SO_LINGER 0) rather than a FIN.
+                socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO)).unwrap();
+            });
+
+            let mut g = TestGuest::new();
+            let h = g.socket(64 * 1024, 64 * 1024);
+            g.connect(h, SocketAddrV4::new(GATEWAY_IP, port), 40003);
+            let data = pattern(4_000_000, 3);
+            let mut sent = 0;
+            let reset = g.run(Duration::from_secs(20), |g| {
+                let s = g.tcp(h);
+                if s.can_send() && sent < data.len() {
+                    sent += s.send_slice(&data[sent..]).unwrap();
+                }
+                s.state() == stcp::State::Closed
+            });
+            host.join().unwrap();
+            assert!(reset, "the guest's connection was not reset (it sent {sent} bytes)");
+
+            // A new connection still works.
+            let echo = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let echo_port = echo.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = echo.accept().unwrap();
+                let mut message = Vec::new();
+                stream.read_to_end(&mut message).unwrap();
+                stream.write_all(&message).unwrap();
+            });
+            let h = g.socket(4096, 4096);
+            g.connect(h, SocketAddrV4::new(GATEWAY_IP, echo_port), 40004);
+            let (mut sent, mut reply) = (false, Vec::new());
+            let finished = g.run(Duration::from_secs(20), |g| {
+                let s = g.tcp(h);
+                if !sent && s.can_send() {
+                    s.send_slice(b"still working").unwrap();
+                    s.close();
+                    sent = true;
+                }
+                if s.can_recv() {
+                    s.recv(|b| {
+                        reply.extend_from_slice(b);
+                        (b.len(), ())
+                    })
+                    .unwrap();
+                }
+                sent && matches!(s.state(), stcp::State::TimeWait | stcp::State::Closed)
+            });
+            assert!(finished && reply == b"still working", "got {:?}", String::from_utf8_lossy(&reply));
+            server.join().unwrap();
+        });
     }
 }
