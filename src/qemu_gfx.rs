@@ -178,6 +178,7 @@ pub fn add_gfx_to_linker(
          width: i32,
          height: i32,
          stride: i32| {
+            let _timer = crate::qemu_profile::time_host(crate::qemu_profile::HostWork::Display);
             // Get guest memory
             let memory = match caller.get_export("memory") {
                 Some(wasmtime::Extern::Memory(m)) => m,

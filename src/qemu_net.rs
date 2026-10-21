@@ -130,6 +130,7 @@ pub fn add_net_to_linker(linker: &mut Linker<QemuHostState>) -> anyhow::Result<(
     // QEMU sleeps in this while the guest is idle (see wasi_idle_wait).
     let n = net.clone();
     linker.func_wrap("env", "host_net_wait", move |timeout_ns: i64| {
+        let _timer = crate::qemu_profile::time_host(crate::qemu_profile::HostWork::IdleWait);
         n.wait_for_frame(Duration::from_nanos(timeout_ns.max(0) as u64));
     })?;
 

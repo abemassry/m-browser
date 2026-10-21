@@ -297,22 +297,32 @@ impl App {
                 * state.scale_factor,
         };
 
-        let surface_texture = state.surface.get_current_texture();
-
-        match surface_texture {
+        let surface_texture = match state.surface.get_current_texture() {
+            Ok(texture) => texture,
             Err(SurfaceError::Outdated) => {
                 // Ignoring outdated to allow resizing and minimization
                 println!("wgpu surface outdated");
                 return;
             }
-            Err(_) => {
-                surface_texture.expect("Failed to acquire next swap chain texture");
+            Err(SurfaceError::Lost) => {
+                // The swap chain must be recreated.
+                state.surface.configure(&state.device, &state.surface_config);
                 return;
             }
-            Ok(_) => {}
+            Err(e) => {
+                // Timeout: the display is not taking frames, e.g. while the
+                // screen is blanked or powered down. Any other failure: the
+                // frame cannot be shown either. Skip it and try again on the
+                // next redraw; panicking here killed the VM with the window.
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static SKIPPED: AtomicU64 = AtomicU64::new(0);
+                let n = SKIPPED.fetch_add(1, Ordering::Relaxed);
+                if n.is_power_of_two() || n == 0 {
+                    eprintln!("[gfx] no swap chain texture ({e}); skipping frame ({} so far)", n + 1);
+                }
+                return;
+            }
         };
-
-        let surface_texture = surface_texture.unwrap();
 
         let surface_view = surface_texture
             .texture
@@ -930,8 +940,13 @@ impl ApplicationHandler for App {
                     "-drive", "file=/data/m.qcow2,format=qcow2",
                     // With QEMU's default of 128 MiB the guest's X desktop
                     // swaps constantly: everything crawls, and X stalls long
-                    // enough for the guest kernel to drop keystrokes.
-                    "-m", "512",
+                    // enough for the guest kernel to drop keystrokes. With
+                    // 512 MiB, starting Chromium still pushed ~100 MiB to
+                    // swap and kept the kernel busy reclaiming and
+                    // compacting memory (a sixth of the guest's CPU time);
+                    // with 1 GiB none of that happens. (QEMU's memory, which
+                    // includes this, must stay well under wasm32's 4 GiB.)
+                    "-m", "1024",
                     // 256 MiB of translated code. When the buffer fills up,
                     // QEMU discards all translations and has to translate
                     // (and the host recompile) its working set again; with

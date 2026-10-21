@@ -315,6 +315,8 @@ pub fn run_wasm_module(
     if std::env::var("QEMU_WASM_OPT").as_deref() == Ok("speed") {
         config.cranelift_opt_level(wasmtime::OptLevel::Speed);
     }
+    // QEMU_PROFILE=1: sample where QEMU spends its time (see qemu_profile.rs).
+    let profiling = crate::qemu_profile::configure(&mut config);
     let engine = Engine::new(&config)?;
     println!("[qemu] [{:>7.3}s] Engine created", t0.elapsed().as_secs_f64());
 
@@ -373,16 +375,18 @@ pub fn run_wasm_module(
         jit: QemuJitState::new(&engine),
         gfx: gfx_state,
         guest_memory: None,
+        guest_table: None,
         pending_exception: false,
         limits: qemu_jit::qemu_store_limits(),
     };
 
     let mut store = Store::new(&engine, host_state);
     store.limiter(|s| &mut s.limits);
+    crate::qemu_profile::attach(&mut store);
 
     // Load the core module
     println!("[qemu] [{:>7.3}s] Loading module from: {wasm_path}", t0.elapsed().as_secs_f64());
-    let module = match wasmtime::Module::from_file(&engine, wasm_path) {
+    let module = match load_qemu_module(&engine, &config, wasm_path) {
         Ok(m) => {
             println!("[qemu] [{:>7.3}s] Module loaded successfully", t0.elapsed().as_secs_f64());
             m
@@ -392,6 +396,17 @@ pub fn run_wasm_module(
             return Err(e).with_context(|| format!("failed to load wasm module: {wasm_path}"));
         }
     };
+    if profiling {
+        crate::qemu_profile::start(&engine, &module);
+    }
+    // Print the profile's last window however QEMU stops.
+    struct StopProfiler;
+    impl Drop for StopProfiler {
+        fn drop(&mut self) {
+            crate::qemu_profile::stop();
+        }
+    }
+    let _stop_profiler = StopProfiler;
 
     // Instantiate
     println!("[qemu] [{:>7.3}s] Instantiating module...", t0.elapsed().as_secs_f64());
@@ -403,6 +418,9 @@ pub fn run_wasm_module(
     // Cache the guest memory reference in host state for JIT use
     if let Some(wasmtime::Extern::Memory(mem)) = instance.get_export(&mut store, "memory") {
         store.data_mut().guest_memory = Some(mem);
+    }
+    if let Some(wasmtime::Extern::Table(t)) = instance.get_export(&mut store, "__indirect_function_table") {
+        store.data_mut().guest_table = Some(t);
     }
 
     // Reactor builds (wasi_qemu_init/wasi_qemu_step exports) are driven one
@@ -463,6 +481,90 @@ pub fn process_map_count() -> Option<usize> {
     Some(maps.iter().filter(|&&b| b == b'\n').count())
 }
 
+/// Load QEMU's module, compiled with Cranelift's optimizations.
+///
+/// The engine compiles at `OptLevel::None` because it compiles hundreds of
+/// thousands of tiny translation-block modules, where compile time matters
+/// most. QEMU's own code (its interpreter, translator, device models...) runs
+/// all session long, so it is worth optimizing: a second engine with the same
+/// settings but `OptLevel::Speed` compiles it once, the result is cached on
+/// disk, and it is loaded into this engine. (Wasmtime checks that a compiled
+/// module suits the engine it is loaded into, and ignores the optimization
+/// level, which doesn't change what the code does.)
+/// QEMU_WASM_OPT=none skips this and compiles QEMU unoptimized, as before.
+fn load_qemu_module(engine: &Engine, config: &Config, wasm_path: &str) -> anyhow::Result<wasmtime::Module> {
+    use std::hash::{Hash, Hasher};
+
+    if std::env::var("QEMU_WASM_OPT").as_deref() == Ok("none") {
+        return wasmtime::Module::from_file(engine, wasm_path);
+    }
+    let wasm = std::fs::read(wasm_path).with_context(|| format!("cannot read {wasm_path}"))?;
+    let mut speed_config = config.clone();
+    speed_config.cranelift_opt_level(wasmtime::OptLevel::Speed);
+    let speed_engine = Engine::new(&speed_config)?;
+
+    // The cache key covers the module and every setting the code depends on.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    wasm.hash(&mut hasher);
+    speed_engine.precompile_compatibility_hash().hash(&mut hasher);
+    let cache_dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("m-browser");
+    let path = cache_dir.join(format!("qemu-{:016x}.cwasm", hasher.finish()));
+
+    if path.exists() {
+        // SAFETY: the file was written below by precompile_module (for this
+        // very module and these settings), and wasmtime checks it suits the
+        // engine.
+        match unsafe { wasmtime::Module::deserialize_file(engine, &path) } {
+            Ok(module) => return Ok(module),
+            Err(e) => eprintln!("[qemu] cached {} unusable ({e}); recompiling", path.display()),
+        }
+    }
+
+    let started = std::time::Instant::now();
+    eprintln!("[qemu] compiling QEMU's module with optimizations (done once, then cached)...");
+    let compiled = speed_engine.precompile_module(&wasm)?;
+    eprintln!(
+        "[qemu] compiled in {:.1} s; caching it in {}",
+        started.elapsed().as_secs_f64(),
+        path.display()
+    );
+    if let Err(e) = store_compiled(&cache_dir, &path, &compiled) {
+        eprintln!("[qemu] cannot cache the compiled module: {e}");
+    }
+    // SAFETY: just compiled by precompile_module, with these settings.
+    unsafe { wasmtime::Module::deserialize(engine, &compiled) }
+}
+
+/// Write a compiled QEMU module to the cache, keeping only the few most
+/// recent ones (each is tens of megabytes).
+fn store_compiled(dir: &std::path::Path, path: &std::path::Path, compiled: &[u8]) -> std::io::Result<()> {
+    const KEEP: usize = 3;
+    std::fs::create_dir_all(dir)?;
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, compiled)?;
+    std::fs::rename(&tmp, path)?;
+
+    let mut cached: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("qemu-") && n.ends_with(".cwasm"))
+        })
+        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .collect();
+    cached.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, old) in cached.into_iter().skip(KEEP) {
+        let _ = std::fs::remove_file(old);
+    }
+    Ok(())
+}
+
 /// How long QEMU gets to shut down once asked to quit.
 const QUIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -513,6 +615,9 @@ fn run_qemu_reactor(
     let mut next_map_check = MAP_CHECK_INTERVAL;
     // Set once QEMU has been asked to quit, with the time it has to do so.
     let mut quit_deadline: Option<std::time::Instant> = None;
+    // QEMU_JIT_STATS: report the JIT's statistics every minute.
+    let mut last_jit_report =
+        std::env::var_os("QEMU_JIT_STATS").map(|_| std::time::Instant::now());
     loop {
         if quit_deadline.is_none() && stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed)) {
             // Let QEMU power the guest off and close its disk images, so
@@ -549,6 +654,13 @@ fn run_qemu_reactor(
         if status >= 0 {
             println!("[qemu] exited with status {status}");
             return Ok(());
+        }
+
+        if let Some(last) = &mut last_jit_report {
+            if last.elapsed() >= std::time::Duration::from_secs(60) {
+                *last = std::time::Instant::now();
+                report_jit_stats(&store.data().jit);
+            }
         }
 
         let instances = store.data().jit.instances_in_store;
@@ -617,10 +729,12 @@ pub fn migrate_store(
     let mut state = store.into_data();
     state.jit.reset_for_new_store();
     state.guest_memory = None;
+    state.guest_table = None;
     state.pending_exception = false;
 
     let mut store = Store::new(module.engine(), state);
     store.limiter(|s| &mut s.limits);
+    crate::qemu_profile::attach(&mut store);
     let instance = linker
         .instantiate(&mut store, module)
         .context("re-instantiating QEMU in a fresh store")?;
@@ -638,6 +752,9 @@ pub fn migrate_store(
     }
     drop(image);
     store.data_mut().guest_memory = Some(memory);
+    if let Some(wasmtime::Extern::Table(t)) = instance.get_export(&mut store, "__indirect_function_table") {
+        store.data_mut().guest_table = Some(t);
+    }
 
     instance
         .get_typed_func::<(), ()>(&mut store, "wasi_qemu_jit_reset")?
@@ -651,18 +768,29 @@ pub fn migrate_store(
         freed,
         started.elapsed().as_secs_f64() * 1e3
     );
-    {
-        let jit = &store.data().jit;
-        // Each compiled module holds executable mappings, which count
-        // against vm.max_map_count (usually 65530), so keep an eye on them.
-        let maps = process_map_count().map_or_else(|| "?".into(), |n| n.to_string());
-        eprintln!(
-            "[qemu-jit] compiled {} TBs in {:.1} s total, {} reused from cache; {} memory mappings",
-            jit.stats_compiled,
-            jit.stats_compile_time.as_secs_f64(),
-            jit.stats_cache_hits,
-            maps
-        );
+    report_jit_stats(&store.data().jit);
+    Ok((store, instance))
+}
+
+/// Print the JIT's statistics: at each Store migration, and every minute
+/// with QEMU_JIT_STATS set.
+fn report_jit_stats(jit: &qemu_jit::QemuJitState) {
+    // Each compiled module holds executable mappings, which count
+    // against vm.max_map_count (usually 65530), so keep an eye on them.
+    let maps = process_map_count().map_or_else(|| "?".into(), |n| n.to_string());
+    eprintln!(
+        "[qemu-jit] compiled {} TBs in {:.1} s total, {} in the background ({:.1} s of other threads), \
+         {} reused from cache, {} loads shared an instance; {} instances in the store; {} memory mappings",
+        jit.stats_compiled,
+        jit.stats_compile_time.as_secs_f64(),
+        jit.background_compiled(),
+        jit.background_compile_time().as_secs_f64(),
+        jit.stats_cache_hits,
+        jit.stats_shared,
+        jit.instances_in_store,
+        maps
+    );
+    if std::env::var_os("QEMU_JIT_STATS").is_some() {
         let labels = ["<512B", "<1K", "<2K", "<4K", ">=4K"];
         let parts: Vec<String> = jit
             .stats_by_size
@@ -673,11 +801,8 @@ pub fn migrate_store(
                 format!("{l}: {n} x {:.2} ms avg {} B", t.as_secs_f64() * 1e3 / *n as f64, b / n)
             })
             .collect();
-        if std::env::var_os("QEMU_JIT_STATS").is_some() {
-            eprintln!("[qemu-jit] compile cost by size: {}", parts.join(", "));
-        }
+        eprintln!("[qemu-jit] compile cost by size: {}", parts.join(", "));
     }
-    Ok((store, instance))
 }
 
 /// The parts of `data` to copy into a fresh instance's memory, as
