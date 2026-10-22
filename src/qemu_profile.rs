@@ -63,6 +63,12 @@ const HOST_WORK_KINDS: usize = 4;
 /// such an engine needs an epoch deadline, or its wasm code would trap.
 static CONFIGURED: AtomicBool = AtomicBool::new(false);
 
+/// Whether an engine was configured for profiling, so that its Stores need
+/// epoch deadlines.
+pub fn configured() -> bool {
+    CONFIGURED.load(Ordering::Relaxed)
+}
+
 /// Advanced by the ticker together with the engine's epoch, so that a host
 /// call returning can tell whether a sample is due.
 static TICK: AtomicU64 = AtomicU64::new(0);

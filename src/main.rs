@@ -6,6 +6,7 @@ mod qemu_jit;
 mod qemu_keymap;
 mod qemu_net;
 mod qemu_profile;
+mod qemu_threads;
 mod wasm;
 mod winit_wasi;
 

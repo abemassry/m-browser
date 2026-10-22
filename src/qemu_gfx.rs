@@ -114,10 +114,11 @@ pub fn add_gfx_to_linker(
     linker.func_wrap(
         "env",
         "host_gfx_init",
-        |mut caller: Caller<'_, QemuHostState>, width: i32, height: i32| {
+        |caller: Caller<'_, QemuHostState>, width: i32, height: i32| {
             eprintln!("[qemu-gfx] host_gfx_init({width}, {height})");
 
-            let gfx = &mut caller.data_mut().gfx;
+            let gfx = caller.data().gfx.clone();
+            let mut gfx = gfx.lock().unwrap();
             gfx.width = width as u32;
             gfx.height = height as u32;
 
@@ -172,63 +173,51 @@ pub fn add_gfx_to_linker(
     linker.func_wrap(
         "env",
         "host_gfx_update_framebuffer",
-        |mut caller: Caller<'_, QemuHostState>,
+        |caller: Caller<'_, QemuHostState>,
          data_ptr: i32,
          data_len: i32,
          width: i32,
          height: i32,
          stride: i32| {
             let _timer = crate::qemu_profile::time_host(crate::qemu_profile::HostWork::Display);
-            // Get guest memory
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(m)) => m,
-                _ => {
-                    eprintln!("[qemu-gfx] update_framebuffer: guest memory not found");
-                    return;
-                }
-            };
-
-            let mem_data = memory.data(&caller);
-            let ptr = data_ptr as usize;
-            let len = data_len as usize;
+            let ptr = data_ptr as u32 as usize;
+            let len = data_len as u32 as usize;
             let w = width as u32;
             let h = height as u32;
             let s = stride as usize;
 
-            if ptr + len > mem_data.len() {
-                eprintln!(
-                    "[qemu-gfx] update_framebuffer: OOB ({ptr}..{}, mem {})",
-                    ptr + len,
-                    mem_data.len()
-                );
-                return;
-            }
-
-            let guest_pixels = &mem_data[ptr..ptr + len];
-
             // Convert BGRA8 guest pixels to softbuffer's native u32 format (0x00RRGGBB)
             // softbuffer uses native-endian u32 where each pixel is 0x00RRGGBB
-            let pixel_count = (w * h) as usize;
-            let mut buffer_data: Vec<u32> = Vec::with_capacity(pixel_count);
+            let converted = crate::qemu_jit::with_guest(&caller, ptr, len, |guest_pixels| {
+                let pixel_count = (w * h) as usize;
+                let mut buffer_data: Vec<u32> = Vec::with_capacity(pixel_count);
 
-            for row in 0..h as usize {
-                let row_start = row * s;
-                for col in 0..w as usize {
-                    let offset = row_start + col * 4;
-                    if offset + 3 < guest_pixels.len() {
-                        let b = guest_pixels[offset] as u32;
-                        let g = guest_pixels[offset + 1] as u32;
-                        let r = guest_pixels[offset + 2] as u32;
-                        // Skip alpha (offset + 3)
-                        buffer_data.push((r << 16) | (g << 8) | b);
-                    } else {
-                        buffer_data.push(0);
+                for row in 0..h as usize {
+                    let row_start = row * s;
+                    for col in 0..w as usize {
+                        let offset = row_start + col * 4;
+                        if offset + 3 < guest_pixels.len() {
+                            let b = guest_pixels[offset] as u32;
+                            let g = guest_pixels[offset + 1] as u32;
+                            let r = guest_pixels[offset + 2] as u32;
+                            // Skip alpha (offset + 3)
+                            buffer_data.push((r << 16) | (g << 8) | b);
+                        } else {
+                            buffer_data.push(0);
+                        }
                     }
                 }
-            }
+                buffer_data
+            });
+            let Some(buffer_data) = converted else {
+                eprintln!("[qemu-gfx] update_framebuffer: out of bounds ({ptr}+{len})");
+                return;
+            };
 
             // Blit to softbuffer
-            let gfx = &mut caller.data_mut().gfx;
+            let gfx = caller.data().gfx.clone();
+            let mut gfx = gfx.lock().unwrap();
+            let gfx = &mut *gfx;
 
             // Headless: no window to draw into, so optionally save the frame
             // as a PNG for inspection. Throttled to about once per second;
@@ -301,9 +290,11 @@ pub fn add_gfx_to_linker(
     linker.func_wrap(
         "env",
         "host_gfx_resize",
-        |mut caller: Caller<'_, QemuHostState>, width: i32, height: i32| {
+        |caller: Caller<'_, QemuHostState>, width: i32, height: i32| {
             eprintln!("[qemu-gfx] host_gfx_resize({width}, {height})");
-            let gfx = &mut caller.data_mut().gfx;
+            let gfx = caller.data().gfx.clone();
+            let mut gfx = gfx.lock().unwrap();
+            let gfx = &mut *gfx;
             gfx.width = width as u32;
             gfx.height = height as u32;
 
@@ -331,15 +322,15 @@ pub fn add_gfx_to_linker(
         "host_gfx_poll_events",
         move |mut caller: Caller<'_, QemuHostState>, event_buf_ptr: i32, max_events: i32| -> i32 {
             // Drain events from the shared queue into host state
+            let gfx = caller.data().gfx.clone();
+            let mut gfx = gfx.lock().unwrap();
             if let Ok(mut queue) = eq.lock() {
-                let gfx = &mut caller.data_mut().gfx;
                 for ev in queue.drain(..) {
                     gfx.pending_events.push(ev);
                 }
             }
 
             let max = max_events as usize;
-            let gfx = &mut caller.data_mut().gfx;
             let count = gfx.pending_events.len().min(max);
 
             if count == 0 {
@@ -348,27 +339,25 @@ pub fn add_gfx_to_linker(
 
             // Collect events to write
             let events: Vec<InputEvent> = gfx.pending_events.drain(..count).collect();
+            drop(gfx);
 
-            // Write events to guest memory
-            let memory = match caller.get_export("memory") {
-                Some(wasmtime::Extern::Memory(m)) => m,
-                _ => return 0,
-            };
-
-            let mem_data = memory.data_mut(&mut caller);
-            let buf_offset = event_buf_ptr as usize;
-            let needed = count * 12; // 3 x i32 per event
-
-            if buf_offset + needed > mem_data.len() {
-                eprintln!("[qemu-gfx] poll_events: buffer OOB");
+            // Write events to guest memory: 3 x i32 per event
+            let written = crate::qemu_jit::with_guest_mut(
+                &mut caller,
+                event_buf_ptr as u32 as usize,
+                count * 12,
+                |buf| {
+                    for (i, ev) in events.iter().enumerate() {
+                        let base = i * 12;
+                        buf[base..base + 4].copy_from_slice(&ev.event_type.to_le_bytes());
+                        buf[base + 4..base + 8].copy_from_slice(&ev.code.to_le_bytes());
+                        buf[base + 8..base + 12].copy_from_slice(&ev.value.to_le_bytes());
+                    }
+                },
+            );
+            if written.is_none() {
+                eprintln!("[qemu-gfx] poll_events: buffer out of bounds");
                 return 0;
-            }
-
-            for (i, ev) in events.iter().enumerate() {
-                let base = buf_offset + i * 12;
-                mem_data[base..base + 4].copy_from_slice(&ev.event_type.to_le_bytes());
-                mem_data[base + 4..base + 8].copy_from_slice(&ev.code.to_le_bytes());
-                mem_data[base + 8..base + 12].copy_from_slice(&ev.value.to_le_bytes());
             }
 
             count as i32

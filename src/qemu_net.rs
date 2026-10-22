@@ -86,16 +86,11 @@ pub fn add_net_to_linker(linker: &mut Linker<QemuHostState>) -> anyhow::Result<(
     linker.func_wrap(
         "env",
         "host_net_send",
-        move |mut caller: Caller<'_, QemuHostState>, ptr: u32, len: u32| -> i32 {
-            let Some(memory) = guest_memory(&mut caller) else {
-                return -1;
-            };
-            let start = ptr as usize;
-            match memory.data(&caller).get(start..start.saturating_add(len as usize)) {
-                Some(frame) => {
-                    n.from_guest(frame);
-                    len as i32
-                }
+        move |caller: Caller<'_, QemuHostState>, ptr: u32, len: u32| -> i32 {
+            match crate::qemu_jit::with_guest(&caller, ptr as usize, len as usize, |frame| {
+                n.from_guest(frame)
+            }) {
+                Some(()) => len as i32,
                 None => -1,
             }
         },
@@ -110,18 +105,13 @@ pub fn add_net_to_linker(linker: &mut Linker<QemuHostState>) -> anyhow::Result<(
             let Some(frame) = n.to_guest() else {
                 return 0;
             };
-            let Some(memory) = guest_memory(&mut caller) else {
-                return 0;
-            };
             if frame.len() > size as usize {
                 return 0;
             }
-            let start = ptr as usize;
-            match memory.data_mut(&mut caller).get_mut(start..start + frame.len()) {
-                Some(buf) => {
-                    buf.copy_from_slice(&frame);
-                    frame.len() as i32
-                }
+            match crate::qemu_jit::with_guest_mut(&mut caller, ptr as usize, frame.len(), |buf| {
+                buf.copy_from_slice(&frame)
+            }) {
+                Some(()) => frame.len() as i32,
                 None => 0,
             }
         },
@@ -134,20 +124,22 @@ pub fn add_net_to_linker(linker: &mut Linker<QemuHostState>) -> anyhow::Result<(
         n.wait_for_frame(Duration::from_nanos(timeout_ns.max(0) as u64));
     })?;
 
+    // The multi-threaded QEMU's other threads end that sleep with this, when
+    // they need its main loop (see wasi_main_wake in QEMU).
+    let n = net.clone();
+    linker.func_wrap("env", "host_main_wake", move || n.wake_main())?;
+
     // A port forwarding rule from QEMU's command line (hostfwd=...).
     // Returns 0, or -1 after printing why the rule cannot be used.
     linker.func_wrap(
         "env",
         "host_net_hostfwd",
-        move |mut caller: Caller<'_, QemuHostState>, ptr: u32, len: u32| -> i32 {
-            let Some(memory) = guest_memory(&mut caller) else {
+        move |caller: Caller<'_, QemuHostState>, ptr: u32, len: u32| -> i32 {
+            let Some(rule) = crate::qemu_jit::with_guest(&caller, ptr as usize, len as usize, |bytes| {
+                String::from_utf8_lossy(bytes).into_owned()
+            }) else {
                 return -1;
             };
-            let start = ptr as usize;
-            let Some(bytes) = memory.data(&caller).get(start..start.saturating_add(len as usize)) else {
-                return -1;
-            };
-            let rule = String::from_utf8_lossy(bytes).into_owned();
             match net.add_forward(&rule) {
                 Ok((host, guest)) => {
                     eprintln!("[qemu-net] forwarding {host} to the guest's {guest}");
@@ -163,12 +155,6 @@ pub fn add_net_to_linker(linker: &mut Linker<QemuHostState>) -> anyhow::Result<(
     Ok(())
 }
 
-fn guest_memory(caller: &mut Caller<'_, QemuHostState>) -> Option<wasmtime::Memory> {
-    caller.data().guest_memory.or_else(|| match caller.get_export("memory") {
-        Some(wasmtime::Extern::Memory(m)) => Some(m),
-        _ => None,
-    })
-}
 
 // ---------------------------------------------------------------------------
 //  The two queues between QEMU's thread and the network thread
@@ -183,6 +169,8 @@ struct Shared {
     to_guest_len: AtomicUsize,
     /// Signalled when a frame is added to `to_guest`, for `host_net_wait`.
     to_guest_ready: Condvar,
+    /// Set by `wake_main`: QEMU's main loop has work, stop waiting.
+    main_wake: AtomicBool,
     /// Set by the network thread when `to_guest` was too full to take all
     /// it had: QEMU then wakes it once the guest has taken enough frames.
     wake_when_drained: AtomicBool,
@@ -206,6 +194,7 @@ impl VirtualNet {
             to_guest: Mutex::new(VecDeque::new()),
             to_guest_len: AtomicUsize::new(0),
             to_guest_ready: Condvar::new(),
+            main_wake: AtomicBool::new(false),
             wake_when_drained: AtomicBool::new(false),
             new_forwards: Mutex::new(Vec::new()),
             waker: Waker::new(poll.registry(), WAKE)?,
@@ -266,10 +255,20 @@ impl VirtualNet {
     /// Sleep for up to `timeout`, or until there is a frame for the guest.
     fn wait_for_frame(&self, timeout: Duration) {
         let queue = self.shared.to_guest.lock().unwrap();
-        let _ = self
-            .shared
-            .to_guest_ready
-            .wait_timeout_while(queue, timeout, |queue| queue.is_empty());
+        let shared = &self.shared;
+        let _ = shared.to_guest_ready.wait_timeout_while(queue, timeout, |queue| {
+            queue.is_empty() && !shared.main_wake.load(Ordering::Acquire)
+        });
+        shared.main_wake.store(false, Ordering::Release);
+    }
+
+    /// End the current or next `wait_for_frame`.
+    fn wake_main(&self) {
+        // Under the lock, so that the waiter cannot miss it between testing
+        // the flag and sleeping.
+        let _queue = self.shared.to_guest.lock().unwrap();
+        self.shared.main_wake.store(true, Ordering::Release);
+        self.shared.to_guest_ready.notify_all();
     }
 }
 
@@ -1202,6 +1201,7 @@ mod tests {
             to_guest: Mutex::new(VecDeque::new()),
             to_guest_len: AtomicUsize::new(0),
             to_guest_ready: Condvar::new(),
+            main_wake: AtomicBool::new(false),
             wake_when_drained: AtomicBool::new(false),
             new_forwards: Mutex::new(Vec::new()),
             waker: Waker::new(poll.registry(), WAKE).unwrap(),

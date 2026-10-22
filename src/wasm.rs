@@ -317,14 +317,39 @@ pub fn run_wasm_module(
     }
     // QEMU_PROFILE=1: sample where QEMU spends its time (see qemu_profile.rs).
     let profiling = crate::qemu_profile::configure(&mut config);
+    // The multi-threaded QEMU (see qemu_threads.rs) shares its memory
+    // between its threads.
+    config.shared_memory(true);
     let engine = Engine::new(&config)?;
     println!("[qemu] [{:>7.3}s] Engine created", t0.elapsed().as_secs_f64());
+
+    // Load the core module
+    println!("[qemu] [{:>7.3}s] Loading module from: {wasm_path}", t0.elapsed().as_secs_f64());
+    let module = match load_qemu_module(&engine, &config, wasm_path) {
+        Ok(m) => {
+            println!("[qemu] [{:>7.3}s] Module loaded successfully", t0.elapsed().as_secs_f64());
+            m
+        }
+        Err(e) => {
+            eprintln!("[qemu] [{:>7.3}s] Failed to load module: {e:?}", t0.elapsed().as_secs_f64());
+            return Err(e).with_context(|| format!("failed to load wasm module: {wasm_path}"));
+        }
+    };
+    // A QEMU built with threads imports its (shared) memory.
+    let shared_memory_type = module.imports().find_map(|imp| match (imp.module(), imp.name()) {
+        ("env", "memory") => imp.ty().memory().cloned(),
+        _ => None,
+    });
+    let threaded = shared_memory_type.is_some();
+    if threaded {
+        println!("[qemu] [{:>7.3}s] Multi-threaded QEMU: one thread per vCPU", t0.elapsed().as_secs_f64());
+    }
 
     // Core module linker
     let mut linker: wasmtime::Linker<QemuHostState> = wasmtime::Linker::new(&engine);
 
     // Add WASIp1 imports (wasi_snapshot_preview1::*)
-    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state| &mut state.wasi)?;
+    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state| state.wasi_ctx())?;
 
     // Add QEMU JIT imports (env::wasi_jit_compile, env::wasi_jit_call, env::wasi_jit_drop)
     qemu_jit::add_jit_to_linker(&mut linker)?;
@@ -335,12 +360,27 @@ pub fn run_wasm_module(
     // Add QEMU's user network (env::host_net_send, host_net_recv), which
     // gives the guest DHCP, DNS, pings and UDP through host sockets.
     crate::qemu_net::add_net_to_linker(&mut linker)?;
-    println!("[qemu] [{:>7.3}s] Linker configured", t0.elapsed().as_secs_f64());
 
     // Build WASI context
     let mut wasi_builder = WasiCtxBuilder::new();
     wasi_builder.inherit_stdio();
-    wasi_builder.args(qemu_args);
+    // The multi-threaded QEMU gets as many vCPUs as it can use well
+    // (QEMU_SMP, default 4; fewer on small hosts), unless the arguments
+    // say: Chromium's processes, X and the kernel then run in parallel.
+    // (The single-threaded QEMU would only take turns running them.)
+    let mut args: Vec<String> = qemu_args.iter().map(|a| a.to_string()).collect();
+    if threaded && !args.iter().any(|a| a == "-smp") {
+        let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
+        let smp = std::env::var("QEMU_SMP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(if cpus >= 8 { 4 } else { 2 })
+            .clamp(1, 8);
+        println!("[qemu] [{:>7.3}s] {smp} vCPUs (QEMU_SMP)", t0.elapsed().as_secs_f64());
+        args.push("-smp".into());
+        args.push(smp.to_string());
+    }
+    wasi_builder.args(&args);
 
     // Forward QEMU's tuning/debug knobs (WASI_DEBUG, WASI_GFX_SCALE,
     // QEMU_DUMP_AT, ...) into the sandbox. Only these prefixes are passed so
@@ -369,11 +409,34 @@ pub fn run_wasm_module(
     if let Some(surf) = surface {
         gfx_state.wasi_surface = Some(Arc::new(surf));
     }
+    let gfx = Arc::new(std::sync::Mutex::new(gfx_state));
+    let jit_cache = qemu_jit::JitCache::new(&engine);
+
+    if let Some(memory_type) = shared_memory_type {
+        if profiling {
+            eprintln!("[qemu] QEMU_PROFILE does not follow the multi-threaded QEMU's vCPU threads");
+        }
+        let memory = wasmtime::SharedMemory::new(&engine, memory_type)
+            .context("creating QEMU's shared memory")?;
+        let threads = crate::qemu_threads::QemuThreads::new(&engine, memory.clone(), wasi_ctx, gfx, jit_cache);
+        crate::qemu_threads::add_threads_to_linker(&mut linker, &threads)?;
+        let mut store = threads.new_store();
+        linker.define(&store, "env", "memory", memory)?;
+        threads.set_instance_pre(linker.instantiate_pre(&module)?);
+        println!("[qemu] [{:>7.3}s] Linker configured", t0.elapsed().as_secs_f64());
+
+        println!("[qemu] [{:>7.3}s] Instantiating module...", t0.elapsed().as_secs_f64());
+        let instance = threads.instantiate(&mut store).context("failed to instantiate QEMU module")?;
+        println!("[qemu] [{:>7.3}s] Module instantiated", t0.elapsed().as_secs_f64());
+        return run_qemu_reactor(store, instance, &linker, &module, t0, stop, true);
+    }
+    println!("[qemu] [{:>7.3}s] Linker configured", t0.elapsed().as_secs_f64());
 
     let host_state = QemuHostState {
-        wasi: wasi_ctx,
-        jit: QemuJitState::new(&engine),
-        gfx: gfx_state,
+        wasi: qemu_jit::WasiSlot::Own(wasi_ctx),
+        wasi_locked: false,
+        jit: QemuJitState::new(jit_cache),
+        gfx,
         guest_memory: None,
         guest_table: None,
         pending_exception: false,
@@ -384,18 +447,6 @@ pub fn run_wasm_module(
     store.limiter(|s| &mut s.limits);
     crate::qemu_profile::attach(&mut store);
 
-    // Load the core module
-    println!("[qemu] [{:>7.3}s] Loading module from: {wasm_path}", t0.elapsed().as_secs_f64());
-    let module = match load_qemu_module(&engine, &config, wasm_path) {
-        Ok(m) => {
-            println!("[qemu] [{:>7.3}s] Module loaded successfully", t0.elapsed().as_secs_f64());
-            m
-        }
-        Err(e) => {
-            eprintln!("[qemu] [{:>7.3}s] Failed to load module: {e:?}", t0.elapsed().as_secs_f64());
-            return Err(e).with_context(|| format!("failed to load wasm module: {wasm_path}"));
-        }
-    };
     if profiling {
         crate::qemu_profile::start(&engine, &module);
     }
@@ -417,7 +468,7 @@ pub fn run_wasm_module(
 
     // Cache the guest memory reference in host state for JIT use
     if let Some(wasmtime::Extern::Memory(mem)) = instance.get_export(&mut store, "memory") {
-        store.data_mut().guest_memory = Some(mem);
+        store.data_mut().guest_memory = Some(qemu_jit::GuestMem::Plain(mem));
     }
     if let Some(wasmtime::Extern::Table(t)) = instance.get_export(&mut store, "__indirect_function_table") {
         store.data_mut().guest_table = Some(t);
@@ -426,7 +477,7 @@ pub fn run_wasm_module(
     // Reactor builds (wasi_qemu_init/wasi_qemu_step exports) are driven one
     // main-loop iteration at a time; see run_qemu_reactor.
     if instance.get_func(&mut store, "wasi_qemu_step").is_some() {
-        return run_qemu_reactor(store, instance, &linker, &module, t0, stop);
+        return run_qemu_reactor(store, instance, &linker, &module, t0, stop, false);
     }
 
     // Get and call _start
@@ -471,9 +522,21 @@ pub fn run_wasm_module(
 /// reuse a cached module and add no mappings, but each still holds about
 /// 0.4 KB, and every move costs a pause (copying QEMU's memory, ~0.5 s) plus
 /// re-instantiating the TBs in use, so moves should not be too frequent.
-const MIGRATE_AFTER_INSTANCES: u32 = 100_000;
-const MAP_CHECK_INTERVAL: u32 = 512;
-const MAP_COUNT_SOFT_LIMIT: usize = 45_000;
+pub(crate) const MIGRATE_AFTER_INSTANCES: u32 = 100_000;
+
+/// `MIGRATE_AFTER_INSTANCES`, or QEMU_MIGRATE_AFTER=<instances> (for
+/// testing moves: they are rare otherwise).
+pub(crate) fn migrate_after_instances() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("QEMU_MIGRATE_AFTER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MIGRATE_AFTER_INSTANCES)
+    })
+}
+pub(crate) const MAP_CHECK_INTERVAL: u32 = 512;
+pub(crate) const MAP_COUNT_SOFT_LIMIT: usize = 45_000;
 
 /// Number of memory mappings of this process, if the OS reports it.
 pub fn process_map_count() -> Option<usize> {
@@ -584,6 +647,7 @@ fn run_qemu_reactor(
     module: &wasmtime::Module,
     t0: std::time::Instant,
     stop: Option<Arc<AtomicBool>>,
+    threaded: bool,
 ) -> anyhow::Result<()> {
     println!("[qemu] [{:>7.3}s] Initializing (reactor)...", t0.elapsed().as_secs_f64());
     instance
@@ -662,9 +726,14 @@ fn run_qemu_reactor(
                 report_jit_stats(&store.data().jit);
             }
         }
+        if threaded {
+            // No TB runs on the main thread: its Store never needs moving
+            // (the vCPU threads move theirs, see qemu_threads.rs).
+            continue;
+        }
 
         let instances = store.data().jit.instances_in_store;
-        let mut migrate = instances >= MIGRATE_AFTER_INSTANCES;
+        let mut migrate = instances >= migrate_after_instances();
         if !migrate && instances >= next_map_check {
             next_map_check = instances + MAP_CHECK_INTERVAL;
             migrate = process_map_count().is_some_and(|n| n > MAP_COUNT_SOFT_LIMIT);
@@ -679,7 +748,7 @@ fn run_qemu_reactor(
             // The cached modules are what remains mapped now. If they alone
             // use most of the budget, moves would repeat constantly: trim.
             if process_map_count().is_some_and(|n| n > MAP_COUNT_SOFT_LIMIT * 2 / 3) {
-                let jit = &mut store.data_mut().jit;
+                let mut jit = store.data().jit.cache.lock().unwrap();
                 let keep = jit.module_cache_len() / 2;
                 jit.shrink_module_cache(keep);
                 eprintln!(
@@ -727,6 +796,7 @@ pub fn migrate_store(
 
     // Dropping the old Store here is what actually frees the TB instances.
     let mut state = store.into_data();
+    state.release_wasi();
     state.jit.reset_for_new_store();
     state.guest_memory = None;
     state.guest_table = None;
@@ -751,7 +821,7 @@ pub fn migrate_store(
         data[*offset..*offset + run.len()].copy_from_slice(run);
     }
     drop(image);
-    store.data_mut().guest_memory = Some(memory);
+    store.data_mut().guest_memory = Some(qemu_jit::GuestMem::Plain(memory));
     if let Some(wasmtime::Extern::Table(t)) = instance.get_export(&mut store, "__indirect_function_table") {
         store.data_mut().guest_table = Some(t);
     }
@@ -774,10 +844,11 @@ pub fn migrate_store(
 
 /// Print the JIT's statistics: at each Store migration, and every minute
 /// with QEMU_JIT_STATS set.
-fn report_jit_stats(jit: &qemu_jit::QemuJitState) {
+fn report_jit_stats(store_jit: &qemu_jit::QemuJitState) {
     // Each compiled module holds executable mappings, which count
     // against vm.max_map_count (usually 65530), so keep an eye on them.
     let maps = process_map_count().map_or_else(|| "?".into(), |n| n.to_string());
+    let jit = store_jit.cache.lock().unwrap();
     eprintln!(
         "[qemu-jit] compiled {} TBs in {:.1} s total, {} in the background ({:.1} s of other threads), \
          {} reused from cache, {} loads shared an instance; {} instances in the store; {} memory mappings",
@@ -786,8 +857,8 @@ fn report_jit_stats(jit: &qemu_jit::QemuJitState) {
         jit.background_compiled(),
         jit.background_compile_time().as_secs_f64(),
         jit.stats_cache_hits,
-        jit.stats_shared,
-        jit.instances_in_store,
+        store_jit.stats_shared,
+        store_jit.instances_in_store,
         maps
     );
     if std::env::var_os("QEMU_JIT_STATS").is_some() {

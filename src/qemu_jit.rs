@@ -40,8 +40,30 @@ struct CompiledTB {
 //  JIT State
 // ---------------------------------------------------------------------------
 
-pub struct QemuJitState {
+/// The compiled TB modules, and the compiler threads that add to them:
+/// shared by every Store QEMU runs in (each vCPU thread has its own in the
+/// multi-threaded build, see qemu_threads.rs).
+pub struct JitCache {
     engine: Engine,
+    /// Compiled TB modules keyed by their wasm bytes. A `Module` belongs to
+    /// the Engine, not a Store, so after a Store migration a TB whose code is
+    /// unchanged only needs re-instantiating, not recompiling. Bounded FIFO:
+    /// every live Module holds executable memory mappings.
+    module_cache: BytesMap<Module>,
+    module_cache_order: VecDeque<Arc<[u8]>>,
+    /// Compiles TB modules on other threads for wasi_jit_load_async.
+    compiler: Option<BackgroundCompiler>,
+    /// Statistics, reported at each Store migration.
+    pub stats_compiled: u64,
+    pub stats_cache_hits: u64,
+    pub stats_compile_time: std::time::Duration,
+    /// Compile count and time by module size: <512, <1K, <2K, <4K, >=4K bytes.
+    pub stats_by_size: [(u64, std::time::Duration, u64); 5],
+}
+
+/// The TB modules instantiated in one Store.
+pub struct QemuJitState {
+    pub cache: Arc<Mutex<JitCache>>,
     modules: HashMap<u32, CompiledTB>,
     /// The table slot holding the instance of each module in the current
     /// Store. TB modules have no state of their own (TCG's registers are
@@ -55,22 +77,8 @@ pub struct QemuJitState {
     /// instances only when their Store is dropped, so this grows until the
     /// runtime moves QEMU into a fresh Store (see `wasm::migrate_store`).
     pub instances_in_store: u32,
-    /// Compiled TB modules keyed by their wasm bytes. A `Module` belongs to
-    /// the Engine, not a Store, so after a Store migration a TB whose code is
-    /// unchanged only needs re-instantiating, not recompiling. Bounded FIFO:
-    /// every live Module holds executable memory mappings.
-    module_cache: BytesMap<Module>,
-    module_cache_order: VecDeque<Arc<[u8]>>,
-    /// Compiles TB modules on other threads for wasi_jit_load_async.
-    compiler: Option<BackgroundCompiler>,
-    /// Statistics, reported at each Store migration.
-    pub stats_compiled: u64,
-    pub stats_cache_hits: u64,
     /// Loads served by an instance already in the Store.
     pub stats_shared: u64,
-    pub stats_compile_time: std::time::Duration,
-    /// Compile count and time by module size: <512, <1K, <2K, <4K, >=4K bytes.
-    pub stats_by_size: [(u64, std::time::Duration, u64); 5],
 }
 
 /// Compiles TB modules on worker threads, so that QEMU's thread does not
@@ -145,22 +153,18 @@ impl BackgroundCompiler {
 /// the current Store (up to MIGRATE_AFTER_INSTANCES).
 const MODULE_CACHE_MAX: usize = 18_000;
 
-impl QemuJitState {
-    pub fn new(engine: &Engine) -> Self {
-        Self {
+impl JitCache {
+    pub fn new(engine: &Engine) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
             engine: engine.clone(),
-            modules: HashMap::new(),
-            by_key: BytesMap::default(),
-            instances_in_store: 0,
             module_cache: BytesMap::default(),
             module_cache_order: VecDeque::new(),
             compiler: None,
             stats_compiled: 0,
             stats_cache_hits: 0,
-            stats_shared: 0,
             stats_compile_time: std::time::Duration::ZERO,
             stats_by_size: [(0, std::time::Duration::ZERO, 0); 5],
-        }
+        }))
     }
 
     /// Drop the oldest cached modules, keeping at most `keep`. Used when the
@@ -268,12 +272,16 @@ impl QemuJitState {
             .map_or(Duration::ZERO, |c| Duration::from_nanos(c.compile_ns.load(Ordering::Relaxed)))
     }
 
-    pub fn flush_cache(&mut self) {
-        let count = self.modules.len();
-        self.modules.clear();
-        self.by_key.clear();
-        if count > 0 {
-            eprintln!("[qemu-jit] flushed {} compiled TBs from cache", count);
+}
+
+impl QemuJitState {
+    pub fn new(cache: Arc<Mutex<JitCache>>) -> Self {
+        Self {
+            cache,
+            modules: HashMap::new(),
+            by_key: BytesMap::default(),
+            instances_in_store: 0,
+            stats_shared: 0,
         }
     }
 
@@ -315,12 +323,82 @@ fn dump_tb_module(n: u64, wasm: &[u8]) {
 use crate::qemu_gfx::QemuGfxState;
 use wasmtime_wasi::p1::WasiP1Ctx;
 
+/// QEMU's linear memory: its own, or, in the multi-threaded build, imported
+/// and shared by all of its threads.
+#[derive(Clone)]
+pub enum GuestMem {
+    Plain(Memory),
+    Shared(wasmtime::SharedMemory),
+}
+
+impl GuestMem {
+    pub fn to_extern(&self) -> Extern {
+        match self {
+            GuestMem::Plain(m) => Extern::Memory(*m),
+            GuestMem::Shared(m) => Extern::SharedMemory(m.clone()),
+        }
+    }
+}
+
+/// Run `f` on the `len` bytes of QEMU's memory at `ptr`; `None` if they are
+/// out of bounds. Other threads may be writing shared memory meanwhile: `f`
+/// must not rely on the bytes staying the same.
+pub fn with_guest<R>(
+    caller: &Caller<'_, QemuHostState>,
+    ptr: usize,
+    len: usize,
+    f: impl FnOnce(&[u8]) -> R,
+) -> Option<R> {
+    let end = ptr.checked_add(len)?;
+    match caller.data().guest_memory.as_ref()? {
+        GuestMem::Plain(m) => m.data(caller).get(ptr..end).map(f),
+        GuestMem::Shared(m) => {
+            let cells = m.data().get(ptr..end)?;
+            // SAFETY: in bounds; racing writes from other threads only make
+            // the snapshot inconsistent, which callers tolerate.
+            let bytes = unsafe { std::slice::from_raw_parts(cells.as_ptr() as *const u8, len) };
+            Some(f(bytes))
+        }
+    }
+}
+
+/// Like `with_guest`, to write QEMU's memory.
+pub fn with_guest_mut<R>(
+    caller: &mut Caller<'_, QemuHostState>,
+    ptr: usize,
+    len: usize,
+    f: impl FnOnce(&mut [u8]) -> R,
+) -> Option<R> {
+    let end = ptr.checked_add(len)?;
+    match caller.data().guest_memory.clone()? {
+        GuestMem::Plain(m) => m.data_mut(caller).get_mut(ptr..end).map(f),
+        GuestMem::Shared(m) => {
+            let cells = m.data().get(ptr..end)?;
+            // SAFETY: in bounds; QEMU hands the host buffers that no other
+            // thread uses meanwhile.
+            let bytes =
+                unsafe { std::slice::from_raw_parts_mut(cells.as_ptr() as *mut u8, len) };
+            Some(f(bytes))
+        }
+    }
+}
+
+/// The WASI context of a Store: its own, or the one all of QEMU's threads
+/// share (see `qemu_threads::SharedWasi`).
+pub enum WasiSlot {
+    Own(WasiP1Ctx),
+    Shared(Arc<crate::qemu_threads::SharedWasi>),
+}
+
 pub struct QemuHostState {
-    pub wasi: WasiP1Ctx,
+    pub wasi: WasiSlot,
+    /// Whether this Store's thread holds the shared WASI context's lock,
+    /// which it does from a WASI call until it returns (see `wasi_ctx`).
+    pub wasi_locked: bool,
     pub jit: QemuJitState,
-    pub gfx: QemuGfxState,
+    pub gfx: Arc<Mutex<QemuGfxState>>,
     /// Cached reference to the guest's linear memory (set after instantiation)
-    pub guest_memory: Option<Memory>,
+    pub guest_memory: Option<GuestMem>,
     /// Cached reference to QEMU's function table, which TB modules import and
     /// their entry functions go into (set after instantiation)
     pub guest_table: Option<Table>,
@@ -333,6 +411,35 @@ pub struct QemuHostState {
     /// instances per Store, which a burst of new TBs between two Store
     /// migrations could otherwise exceed.
     pub limits: wasmtime::StoreLimits,
+}
+
+impl QemuHostState {
+    /// The WASI context, for wasmtime-wasi's functions. With a shared one,
+    /// this takes its lock, which a call hook on the Store releases when the
+    /// WASI function returns (`qemu_threads::install_store_hooks`).
+    pub fn wasi_ctx(&mut self) -> &mut WasiP1Ctx {
+        match &mut self.wasi {
+            WasiSlot::Own(ctx) => ctx,
+            WasiSlot::Shared(shared) => {
+                if !self.wasi_locked {
+                    shared.lock();
+                    self.wasi_locked = true;
+                }
+                // SAFETY: this thread holds the lock (see SharedWasi).
+                unsafe { &mut *shared.ctx.get() }
+            }
+        }
+    }
+
+    /// Release the shared WASI context's lock, if this Store holds it.
+    pub fn release_wasi(&mut self) {
+        if self.wasi_locked {
+            self.wasi_locked = false;
+            if let WasiSlot::Shared(shared) = &self.wasi {
+                shared.unlock();
+            }
+        }
+    }
 }
 
 /// Store limits for the QEMU Store (see `QemuHostState::limits`). Above the
@@ -423,13 +530,9 @@ pub fn add_jit_to_linker(linker: &mut Linker<QemuHostState>) -> Result<()> {
                     // Clear ctx.tb_ptr so the guest's TB loop stops instead of
                     // retrying the same unknown handle forever (same as the
                     // execution-error path below).
-                    if let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") {
-                        let data = mem.data_mut(&mut caller);
-                        let p = ctx_ptr as usize;
-                        if p + 12 <= data.len() {
-                            data[p + 8..p + 12].copy_from_slice(&0u32.to_le_bytes());
-                        }
-                    }
+                    with_guest_mut(&mut caller, ctx_ptr as usize + 8, 4, |tb_ptr| {
+                        tb_ptr.copy_from_slice(&0u32.to_le_bytes())
+                    });
                     return 0;
                 }
             };
@@ -474,14 +577,10 @@ pub fn add_jit_to_linker(linker: &mut Linker<QemuHostState>) -> Result<()> {
 
                     // CRITICAL: clear ctx.tb_ptr so the C-side loop in tcg_qemu_tb_exec exits.
                     // Otherwise it retries the same failing TB forever.
-                    if let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") {
-                        let data = mem.data_mut(&mut caller);
-                        let p = ctx_ptr as usize;
-                        // wasmContext layout: env(0) stack(4) tb_ptr(8) ...
-                        if p + 12 <= data.len() {
-                            data[p + 8..p + 12].copy_from_slice(&0u32.to_le_bytes());
-                        }
-                    }
+                    // wasmContext layout: env(0) stack(4) tb_ptr(8) ...
+                    with_guest_mut(&mut caller, ctx_ptr as usize + 8, 4, |tb_ptr| {
+                        tb_ptr.copy_from_slice(&0u32.to_le_bytes())
+                    });
                     0
                 }
             }
@@ -562,42 +661,36 @@ fn jit_load(
     mode: LoadMode,
 ) -> u32 {
     let _timer = crate::qemu_profile::time_host(crate::qemu_profile::HostWork::JitTotal);
-    let memory = match caller.data().guest_memory {
-        Some(m) => m,
-        None => match caller.get_export("memory") {
-            Some(Extern::Memory(m)) => m,
-            _ => {
-                eprintln!("[qemu-jit] compile: guest memory not found");
-                return 0;
-            }
-        },
+    let Some(memory) = caller.data().guest_memory.clone() else {
+        eprintln!("[qemu-jit] compile: guest memory not set");
+        return 0;
     };
 
     // An instance of this very module in the Store already serves any TB
     // with the same code; otherwise copy the bytes out.
     let ws = wasm_ptr as u32 as usize;
-    let we = ws + wasm_len as u32 as usize;
-    let (shared, wasm_bytes) = {
-        let data = memory.data(&*caller);
-        if we > data.len() {
-            eprintln!("[qemu-jit] compile: wasm bytes OOB ({ws}..{we}, mem {})", data.len());
+    let len = wasm_len as u32 as usize;
+    let found = with_guest(caller, ws, len, |wasm| match caller.data().jit.by_key.get(wasm) {
+        Some(&handle) => (Some(handle), None),
+        None => (None, Some(Arc::<[u8]>::from(wasm))),
+    });
+    let wasm_bytes = match found {
+        None => {
+            eprintln!("[qemu-jit] compile: wasm bytes out of bounds ({ws}+{len})");
             return 0;
         }
-        let wasm = &data[ws..we];
-        match caller.data().jit.by_key.get(wasm) {
-            Some(&handle) => (Some(handle), None),
-            None => (None, Some(Arc::<[u8]>::from(wasm))),
+        Some((Some(handle), _)) => {
+            caller.data_mut().jit.stats_shared += 1;
+            return handle;
         }
+        Some((None, bytes)) => bytes.expect("set when not shared"),
     };
-    if let Some(handle) = shared {
-        caller.data_mut().jit.stats_shared += 1;
-        return handle;
-    }
-    let wasm_bytes = wasm_bytes.expect("set when not shared");
 
     // Compile the TB wasm module, or reuse an identical one compiled
     // before (by an earlier Store, or in the background).
-    let jit = &mut caller.data_mut().jit;
+    let cache = caller.data().jit.cache.clone();
+    let mut guard = cache.lock().unwrap();
+    let jit = &mut *guard;
     jit.collect_background();
     let module = match mode {
         LoadMode::Compile => match jit.get_or_compile(&wasm_bytes) {
@@ -629,6 +722,7 @@ fn jit_load(
             }
         },
     };
+    drop(guard);
 
     // Resolve the TB module's imports:
     //   env.buffer : QEMU's linear memory
@@ -649,7 +743,7 @@ fn jit_load(
     let direct_imports: Option<Vec<Extern>> = module
         .imports()
         .map(|imp| match (imp.module(), imp.name()) {
-            ("env", "buffer") => Some(Extern::Memory(memory)),
+            ("env", "buffer") => Some(memory.to_extern()),
             ("env", "table") => Some(Extern::Table(guest_table)),
             _ => None,
         })
@@ -658,11 +752,11 @@ fn jit_load(
         // The usual case: pass the imports directly, no Linker needed.
         Some(imports) => Instance::new(caller.as_context_mut(), &module, &imports),
         None => {
-            let helper_indices = match read_helper_indices(caller, memory, helpers_ptr, helpers_len) {
+            let helper_indices = match read_helper_indices(caller, helpers_ptr, helpers_len) {
                 Some(h) => h,
                 None => return 0,
             };
-            match legacy_linker(caller, &module, memory, guest_table, &helper_indices) {
+            match legacy_linker(caller, &module, memory.to_extern(), guest_table, &helper_indices) {
                 Some(tb_linker) => tb_linker.instantiate(caller.as_context_mut(), &module),
                 None => return 0,
             }
@@ -712,23 +806,20 @@ fn jit_load(
 /// QEMU builds' TB modules need (see `legacy_linker`).
 fn read_helper_indices(
     caller: &Caller<'_, QemuHostState>,
-    memory: Memory,
     helpers_ptr: i32,
     helpers_len: i32,
 ) -> Option<Vec<u32>> {
-    let data = memory.data(caller);
     let hs = helpers_ptr as u32 as usize;
-    let he = hs + (helpers_len as u32 as usize) * 4;
-    if he > data.len() {
-        eprintln!("[qemu-jit] compile: helper indices OOB ({hs}..{he}, mem {})", data.len());
-        return None;
-    }
-    Some(
-        data[hs..he]
-            .chunks_exact(4)
+    let len = (helpers_len as u32 as usize) * 4;
+    let indices = with_guest(caller, hs, len, |data| {
+        data.chunks_exact(4)
             .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect(),
-    )
+            .collect()
+    });
+    if indices.is_none() {
+        eprintln!("[qemu-jit] compile: helper indices out of bounds ({hs}+{len})");
+    }
+    indices
 }
 
 /// A Linker for TB modules of older QEMU builds, which import each helper
@@ -737,11 +828,11 @@ fn read_helper_indices(
 fn legacy_linker(
     caller: &mut Caller<'_, QemuHostState>,
     module: &Module,
-    memory: Memory,
+    memory: Extern,
     guest_table: Table,
     helper_indices: &[u32],
 ) -> Option<Linker<QemuHostState>> {
-    let engine = caller.data().jit.engine.clone();
+    let engine = caller.engine().clone();
     let mut tb_linker: Linker<QemuHostState> = Linker::new(&engine);
     if let Err(e) = tb_linker.define(&*caller, "env", "buffer", memory) {
         eprintln!("[qemu-jit] compile: define env/buffer failed: {e}");
