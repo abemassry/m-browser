@@ -12,7 +12,23 @@ and combine it with the utility of the web that puts the power of the web back i
   feature)
 - **Display WASM**: Display wasm files in a surface that renders by default.
 - **Legacy Webpages**: Display legacy webpages in a container that runs a full system including a
-  browser, through wasm, that renders to a surface. (planned feature)
+  browser, through wasm, that renders to a surface: QEMU compiled to WebAssembly runs an Alpine
+  Linux desktop with Chromium (see below).
+
+## A Linux desktop in WebAssembly
+
+Open `file:///<path to m-browser>/qemu-system-x86_64.wasm` to boot the Alpine Linux desktop in
+`m.qcow2` (not in git) with QEMU, built for WebAssembly by the
+[qemu-wasi](https://github.com/abemassry/qemu-wasi) repository. Build m-browser with
+`cargo build --release` and start it from its own directory: QEMU finds its firmware
+(`pc-bios/`) and the disk image there.
+
+## Documentation
+
+The developer documentation starts at [docs/README.md](docs/README.md): an overview, getting
+started, the architecture, and one chapter per part (the QEMU runner, the JIT, threads, display
+and input, networking, headless automation, profiling), plus recipes for adding features and a
+testing and debugging guide.
 
 ## Example inside the M Browser
 
