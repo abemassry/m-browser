@@ -3,7 +3,8 @@
 **What this covers.** How the emulated PC's screen gets from QEMU into
 m-browser's window (or into a PNG file when headless), and how keyboard
 and mouse events travel the other way, in m-browser (`src/qemu_gfx.rs`,
-`src/qemu_keymap.rs`, the input code in `src/app.rs`) and, briefly, in
+`src/qemu_keymap.rs`, the input code in `src/tab_program.rs`) and,
+briefly, in
 QEMU's display backend in the qemu-wasi repository (`display/`). Read it
 before touching any of these, or when keys, clicks or the picture
 misbehave. The QEMU side is described in more depth in the qemu-wasi
@@ -18,12 +19,16 @@ OUTPUT, on QEMU's main-loop thread, every ~30 ms
    -> display backend (qemu-wasi display/): copy what changed, zoom x2,
       host_gfx_update_framebuffer(ptr, len, width, height, stride)
    -> m-browser src/qemu_gfx.rs: BGRA bytes -> one 0x00RRGGBB u32 per pixel
-        GUI:      softbuffer blits it into the child window
+        GUI:      scaled to fit the child window, which covers the page
+                  area, black around it; softbuffer shows the whole window
         headless: PNG written to $QEMU_SNAPSHOT (temp file + rename, <= 1/s)
 
 INPUT
-  winit events on the UI thread (App::window_event in src/app.rs)
+  winit events on the UI thread (App::window_event in src/app.rs,
+  QemuTab::handle_event in src/tab_program.rs)
    -> InputEvent { event_type, code, value } pushed on the GfxEventQueue
+      (pointer positions in window pixels; the host maps them into the
+      frame when it takes them from the queue)
    -> QEMU's display refresh calls host_gfx_poll_events(buf, max)
    -> display backend: at most KEYS_PER_POLL key/text events per refresh
    -> QEMU input layer -> USB tablet, keyboard, or a text console
@@ -93,10 +98,10 @@ lists every host import.
 
 | Import | Signature | Semantics |
 |---|---|---|
-| `host_gfx_init` | `(width: i32, height: i32)` | Once, when the display starts, with the zoomed size. Creates the softbuffer `Context` and `Surface` on the child window's wasi-gfx surface and sizes the buffer. Without a surface (headless) logs "no wasi surface available (running headless?)" |
-| `host_gfx_resize` | `(width: i32, height: i32)` | The guest's screen size or the zoom changed (zoomed size). Records it and resizes the buffer; the window is not resized |
-| `host_gfx_update_framebuffer` | `(data_ptr: i32, data_len: i32, width: i32, height: i32, stride: i32)` | Show `height` rows of `width` BGRA pixels at `data_ptr` in QEMU's memory, rows `stride` bytes apart. Out of bounds: logged, frame dropped |
-| `host_gfx_poll_events` | `(event_buf: i32, max_events: i32) -> i32` | Moves the queued input into `pending_events`, writes up to `max_events` events of 12 bytes (`type`, `code`, `value`, little-endian `i32`s) to `event_buf` and returns how many. The rest waits for the next call |
+| `host_gfx_init` | `(width: i32, height: i32)` | Once, when the display starts, with the zoomed size. Creates the softbuffer `Context` and `Surface` on the child window's wasi-gfx surface, takes the window's size from the queue and paints the window black. Without a surface (headless) logs "no wasi surface available (running headless?)" |
+| `host_gfx_resize` | `(width: i32, height: i32)` | The guest's screen size or the zoom changed (zoomed size). Records it; the next frame has that size |
+| `host_gfx_update_framebuffer` | `(data_ptr: i32, data_len: i32, width: i32, height: i32, stride: i32)` | Show `height` rows of `width` BGRA pixels at `data_ptr` in QEMU's memory, rows `stride` bytes apart: kept as `last_frame` and painted scaled to the window (`present()`). Out of bounds: logged, frame dropped |
+| `host_gfx_poll_events` | `(event_buf: i32, max_events: i32) -> i32` | Takes the queued events (`take_events()`: host-only ones handled, pointer positions mapped into the frame, the rest into `pending_events`), paints the window again after a new window size or a repaint request, writes up to `max_events` events of 12 bytes (`type`, `code`, `value`, little-endian `i32`s) to `event_buf` and returns how many. The rest waits for the next call |
 
 ## The display state and who shares it
 
@@ -104,8 +109,10 @@ lists every host import.
 
 | Field | Meaning |
 |---|---|
-| `width`, `height` | Current buffer size (the zoomed frame) |
-| `sb_context`, `sb_surface` | softbuffer context and surface; `None` when headless |
+| `width`, `height` | The size of QEMU's frames (the zoomed frame) |
+| `last_frame` | The last frame, `width` x `height` pixels, to paint again after a resize or a repaint request |
+| `window_width`, `window_height` | The child window's size in physical pixels, from the UI (`EVENT_WINDOW_SIZE`); 0 x 0 until then, and headless: frames are shown unscaled |
+| `sb_context`, `sb_surface` | softbuffer context and surface; `None` when headless. The buffer has the window's size (`buffer_size`) |
 | `wasi_surface` | `Arc` of the child window's wasi-gfx `Surface`, which softbuffer draws through |
 | `pending_events` | Events taken from the queue that QEMU had no room for yet |
 | `initialized` | Set by `host_gfx_init`, read nowhere |
@@ -129,20 +136,23 @@ deadlock.
 
 ## Input: from winit to QEMU
 
-`App::window_event()` produces events only while QEMU runs (that is, while
-`App::qemu_event_queue` exists):
+`App::window_event()` passes every event to the current tab's program
+(`TabProgram::handle_event()`); a tab running QEMU turns them into events
+for its own queue in `QemuTab::handle_event()` (`src/tab_program.rs`),
+while QEMU's thread runs. Tabs in the background get nothing:
 
-- **Mouse**, only for events of the child window (`window_id ==
-  child_window_id`). `CursorMoved` gives `(1, 0, x)` and `(1, 1, y)` in
+- **Mouse**, only for events of QEMU's own child window (`window_id ==
+  window.id()`). `CursorMoved` gives `(1, 0, x)` and `(1, 1, y)` in
   physical window pixels. `MouseInput` gives `(2, button, 1 or 0)` with
   left 0, middle 1, right 2, back 5, forward 6 (other buttons are
   dropped). Each `MouseWheel` event gives a press and a release of button
   3 (up) or 4 (down), whatever the distance scrolled.
 - **Keyboard**, from either window (the child window never takes keyboard
   focus, so winit reports keys against the main window), but only while
-  egui does not want the keyboard: `qemu_takes_keys` is false while an
-  egui text field such as the address bar has focus
-  (`Context::wants_keyboard_input()`). Each key press or release gives
+  egui does not want the keyboard: `keys` is false while an egui text
+  field such as the address bar has focus
+  (`Context::wants_keyboard_input()`); a click into QEMU's window takes
+  that focus away. Each key press or release gives
   `(3, evdev, 1 or 0)` via `keycode_to_evdev()`; keys without a mapping are
   logged ("[qemu-gfx] no evdev mapping for ..., ignoring") and skipped. A
   press also gives one `(5, code point, 0)` per character of
@@ -153,14 +163,24 @@ deadlock.
 
 | Type | Meaning | `code` | `value` | Produced by |
 |---|---|---|---|---|
-| 1 | Pointer position | 0 = x, 1 = y | Pixel in the window, i.e. in the zoomed frame | `CursorMoved`; headless `!move` |
+| 1 | Pointer position | 0 = x, 1 = y | Pixel in the zoomed frame; the UI sends window pixels, which `take_events()` maps into the frame | `CursorMoved`; headless `!move` |
 | 2 | Pointer button | QEMU `InputButton`: 0 left, 1 middle, 2 right, 3 wheel up, 4 wheel down, 5 side, 6 extra | 1 down, 0 up | `MouseInput`, `MouseWheel`; headless `!click`, `!down`, `!up` |
 | 3 | Key | Linux evdev code | 1 down, 0 up | `KeyboardInput`; headless typing |
 | 4 | Resize | Width | Height | Nobody. QEMU prints it and ignores it |
 | 5 | Text | Unicode code point | 0 | Key presses with text; headless typing. Used by text consoles only |
+| 6 | Repaint (`EVENT_REPAINT`) | 0 | 0 | `qemu_gfx::request_repaint()`, when QEMU's tab comes back. Host only: `host_gfx_poll_events()` takes it out of the queue and presents the last frame again (`QemuGfxState::last_frame`); QEMU never sees it |
+| 7 | Window size (`EVENT_WINDOW_SIZE`) | Width | Height, physical pixels | `qemu_gfx::set_window_size()`: when QEMU's tab starts, comes back, or its window is resized. Host only: frames are scaled to this size |
 
-**Note:** the comment on `InputEvent` in `src/qemu_gfx.rs` lists types 1
-to 4 only; type 5 came later.
+**Note:** types 6 and 7 are m-browser's own: `take_events()` takes them
+out of the queue, and QEMU's display backend never sees them.
+
+**Why the repaint.** A tab in the background hides its child window, and
+X11 keeps no picture of a hidden window. QEMU sends a frame only when the
+screen changed, and an unchanged one about once a second
+(`FRAME_RESEND_INTERVAL` in qemu-wasi's `display/wasi_gfx_display.c`),
+so without the repaint a tab could come back black for up to a second.
+`host_gfx_poll_events()` runs at every display refresh, about 30 times a
+second, also while the guest is paused.
 
 ### How QEMU consumes them
 
@@ -272,11 +292,25 @@ factor is lowered until the result fits in 1600x1200, but never below 1:
 
 ## Pitfalls
 
-**Pitfall:** coordinates are window pixels of the zoomed frame, which is
-drawn 1:1 at the child window's top-left corner; QEMU clamps positions to
-the frame. The child window is 1080x720 logical pixels and is not resized
-to the frame: on a display with scale factor 1 that is smaller than a
-1280x800 frame, which is then cut off at the right and bottom.
+**Scaling to the window.** The child window covers the browser's page
+area and follows it when the main window is resized (`TabProgram::place()`;
+the UI sends the new size in physical pixels with
+`qemu_gfx::set_window_size()`). `QemuGfxState::view()` fits the frame
+into the window, keeping its proportions, and centers it; `present()`
+paints every pixel of the window (`draw_scaled()`, nearest neighbour,
+black outside the frame), so nothing of what the screen showed before
+the window appeared survives. A pointer position arrives in window
+pixels; `to_frame()` maps it into the frame, clamping positions on the
+black bars to the frame's edge, before QEMU sees it.
+
+**Pitfall:** nearest-neighbour scaling by a factor that is not a whole
+number makes some pixel columns and rows wider than others, which shows
+on text. Scaling by whole numbers is exact: QEMU's own zoom
+(`WASI_GFX_SCALE=1` leaves it to m-browser) and the window's size decide
+the factor.
+
+**Pitfall:** headless there is no window: frames are written unscaled,
+and pointer positions (`!move X Y`) are pixels of the zoomed frame.
 
 **Pitfall:** absolute positions need an absolute pointing device, such as
 `-device usb-tablet` (on `-device qemu-xhci`). Without one, QEMU's input

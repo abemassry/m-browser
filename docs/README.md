@@ -22,7 +22,7 @@ Start with [01-overview.md](01-overview.md).
 
 | Chapter | What it covers |
 |---|---|
-| [05-browser-ui.md](05-browser-ui.md) | The window, the Markdown browser, starting and stopping QEMU |
+| [05-browser-ui.md](05-browser-ui.md) | The window, tabs and the programs they run (paused in the background), Markdown pages, web tabs (Chromium in QEMU from the web checkpoint), the session kept between runs |
 | [06-qemu-runner.md](06-qemu-runner.md) | Loading QEMU, driving it step by step, moving it to fresh memory |
 | [07-jit-host.md](07-jit-host.md) | Compiling QEMU's generated code: caches, background compilers |
 | [08-threads.md](08-threads.md) | Hosting the multi-threaded QEMU: threads, Stores, shared state |
@@ -30,6 +30,7 @@ Start with [01-overview.md](01-overview.md).
 | [10-networking.md](10-networking.md) | The guest's virtual network: DHCP, DNS, UDP, TCP, ping, port forwarding |
 | [11-headless-and-automation.md](11-headless-and-automation.md) | Running QEMU without a window, typing and clicking from scripts |
 | [12-profiling.md](12-profiling.md) | The sampling profiler |
+| [15-saved-states.md](15-saved-states.md) | Pausing a wasm program, saving it to a file, resuming it in another process; the `--wasm-headless` runner; QEMU's checkpoints; what the GUI saves |
 
 ## Changing it
 

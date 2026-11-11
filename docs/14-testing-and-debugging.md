@@ -25,18 +25,45 @@ the instruction test exercises the JIT host and the runner.
 
 ```sh
 # from the m-browser directory
-cargo test --release --offline qemu_net        # the 11 tests below
+cargo test --release --offline                  # all 50 tests
+cargo test --release --offline qemu_net         # the network's 11, below
+cargo test --release --offline -- saved_state wasm_headless qemu_save   # saved states' 28
+cargo test --release --offline -- tab_program wasm::tests app::tests    # tabs' 6
+cargo test --release --offline -- qemu_gfx qemu_keymap                   # display and keys' 5
 # one test, showing its output:
 cargo test --release --offline qemu_net::tests::tcp_relays_both_ways \
     -- --nocapture
 ```
 
-`qemu_net` selects every test whose path contains it, which is all of
-m-browser's tests. They need no network access and no privileges: the TCP
-tests run a small guest-side TCP/IP stack (smoltcp) against a real
-`VirtualNet` and sockets on 127.0.0.1. `--release` because they move
-megabytes; `--offline` needs the crates downloaded already (drop it
-otherwise). The first run builds the whole crate in test mode.
+A name after `--offline` selects the tests whose path contains it. They
+need no network access and no privileges: the TCP tests run a small
+guest-side TCP/IP stack (smoltcp) against a real `VirtualNet` and sockets
+on 127.0.0.1, and the saved-state tests write their files under the
+system's temporary directory (`TMPDIR`) and remove them. `--release`
+because they move megabytes; `--offline` needs the crates downloaded
+already (drop it otherwise). The first run builds the whole crate in test
+mode. The 28 saved-state tests are listed in
+[15-saved-states.md](15-saved-states.md#tests). The others:
+
+| Test | Checks |
+|---|---|
+| `tab_program::tests::modules_are_told_apart` | QEMU by its imports or exports, components, other core modules, a file that is not wasm |
+| `tab_program::tests::web_disks_are_recognized_and_overlays_kept_when_needed` | `is_web_disk()` (never `m.qcow2`); `remove_overlays()` keeps the web checkpoint's images and other tabs' overlays |
+| `wasm::tests::epochs_pause_resume_and_stop_running_wasm` | On a component's engine and store setup, an endless loop stops while paused, its clock stands still, and a stop makes it trap |
+| `app::tests::addresses_are_told_apart` | `page_kind()`: wasm, Markdown, web, saved-state and setup addresses; `web_label()` |
+| `app::tests::the_session_file_round_trips` | The session file's JSON, an older file without the newer fields, a restored tab |
+| `app::tests::only_a_tabs_own_saved_states_are_removed` | `remove_own_state()` deletes a tab's own state only |
+| `qemu_gfx::tests::the_frame_fits_the_window_keeping_its_proportions` | `view()`: wider, taller and smaller windows |
+| `qemu_gfx::tests::pointer_positions_are_mapped_into_the_frame` | `to_frame()`: edges, middle, the black bars |
+| `qemu_gfx::tests::the_whole_window_is_painted` | `draw_scaled()`: the frame scaled, black around it |
+| `qemu_gfx::tests::host_events_stay_in_the_host` | Window size and repaint events stay in the host; pointer positions use the new size |
+| `qemu_keymap::tests::text_becomes_key_presses` | `text_events()`, `chord_events()`, `char_to_evdev()` |
+
+The network's are:
+
+**Pitfall:** run tests through `cargo test` only. `target/release/deps`
+also holds old builds of the browser itself, named like the test binary
+(`m_browser-<hash>`): starting one of those by hand opens the GUI.
 
 | Test | Checks |
 |---|---|
@@ -134,9 +161,30 @@ machine, with the multi-threaded build and 4 vCPUs.
 10. Chromium: start it from the desktop. In the reference timings its
     window appeared about 3:55 after QEMU started, and a click made while
     it starts is handled within about 10 s (6 to 9 s measured).
-11. Clean shutdown: `poweroff` in the guest (QEMU then exits with status
-    0), or navigate away or close the browser (`asking QEMU to quit`, then
-    `exited with status 0`). Start again: no `in use by another QEMU`.
+11. Tabs: open a second tab ("+"), load a Markdown page, then go back to
+    QEMU's tab with its label: the guest was frozen meanwhile, its screen
+    is back at once, and it goes on (status "QEMU is running"). Also try
+    a component (`breakout.wasm`: the game is where you left it) and a
+    core module (`ticker.wat` built with `wasm-tools parse`, see
+    [15-saved-states.md](15-saved-states.md#tests): the count goes on
+    from where it stopped) in tabs of their own, and switch between all
+    of them.
+12. Clean shutdown: `poweroff` in the guest (QEMU then exits with status
+    0), or navigate away, close QEMU's tab or close the browser (`asking
+    QEMU to quit`, then `exited with status 0`). Start again: no `in use
+    by another QEMU`.
+13. Web tabs (after closing every tab that runs `qemu-system-x86_64.wasm`):
+    menu "Set up web tabs"; when Chromium waits for an address, menu "Save
+    web checkpoint" (the log says `The web checkpoint is ...`); close the
+    setup tab. In a new tab enter `example.com`: Chromium appears and
+    opens it. Enter another address in the same tab, then open a second
+    web tab and switch between them ([05-browser-ui.md](05-browser-ui.md#web-tabs)).
+14. Session: with a Markdown page scrolled down, a web tab and an Asyncify
+    command (`ticker.wat` built with `wasm-tools parse`, then
+    `wasm-opt --asyncify -O1`) in tabs, quit. Start again: the focused
+    tab loads; the others load when opened; the ticker counts on from
+    where it stopped; the Markdown page is scrolled where it was
+    ([05-browser-ui.md](05-browser-ui.md#the-session)).
 
 ## Debugging techniques
 
@@ -150,7 +198,8 @@ GUI from a terminal and capture both streams, as above.
 | `[qemu] [  t s]` | The runner's progress, with seconds since start (`src/wasm.rs`) |
 | `[qemu]` | Runner and threads (`src/wasm.rs`, `src/qemu_threads.rs`) |
 | `[qemu-jit]`, `[qemu-gfx]`, `[qemu-net]`, `[qemu-profile]` | JIT host, display, network, profiler |
-| `[headless]`, `[gfx]`, `[detect]` | Headless runner; browser window and wasm detection (`src/app.rs`) |
+| `[headless]`, `[gfx]`, `[tab <id>]` | Headless runner; the browser window (`src/app.rs`); the kind of module a tab runs (`start_program()`) |
+| `[wasm]` | Core modules other than QEMU, headless or in a tab (`src/wasm_headless.rs`) |
 | `qemu-system-x86_64: ...` | QEMU's own error messages |
 | `[qemu-wasi]`, `qemu-wasi:`, `[wasi-interp]`, `[wasi-prof]`, `wasi-gfx:` | QEMU's WASI port: TB buffer flushes, JIT failures, interpreter and profile reports, display |
 | `WASI_DBG:`, `QEMU_STATUS:` | `WASI_DEBUG` and `QEMU_STATUS_EVERY` output |

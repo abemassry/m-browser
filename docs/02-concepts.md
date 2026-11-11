@@ -68,26 +68,26 @@ cargo build --release --offline    # produces target/release/m-browser
 as git checkouts). It fails as soon as Cargo.toml asks for a crate or
 version that is not in that cache; build once with network access then.
 
-**Note:** `lock_disk_image()` in `src/app.rs` uses `File::try_lock()`,
-which needs Rust 1.89 or newer.
+**Note:** `lock_disk_image()` in `src/tab_program.rs` uses
+`File::try_lock()`, which needs Rust 1.89 or newer.
 
-**Note:** not every crate in Cargo.toml is used by `src/` any more (tokio,
-env_logger, log, wit-bindgen, async-broadcast, callback-future, bytemuck
-and async-trait are not referenced). Check with a build before removing
-them.
+**Note:** not every crate in Cargo.toml is used by `src/` any more
+(env_logger, log, wit-bindgen, async-broadcast, callback-future and
+bytemuck are not referenced; tokio and async-trait only for the text pages
+of `OutputPage` in `src/wasm_headless.rs`). Check with a build before
+removing them.
 
 ### Modules
 
 `mod app;` in `src/main.rs` compiles `src/app.rs` as the module `app`; all
 top-level modules are declared there. `crate::qemu_gfx::InputEvent` names
 an item by its path from the crate root. `src/qemu_net.rs` declares
-`mod tcp;`, which is `src/qemu_net/tcp.rs`. `#[path = "fill.rs"] mod fill;`
-in `src/app.rs` makes `fill.rs` a sub-module of `app`. `pub` makes an item
-visible outside its module, `pub(crate)` only inside this crate (for
-example `MIGRATE_AFTER_INSTANCES` in `src/wasm.rs`). `#[cfg(...)]` compiles
-code only under a condition: `#[cfg(test)]` marks unit tests (in
-`src/qemu_net.rs`), and `src/fill.rs` depends on a Cargo feature that is
-never enabled.
+`mod tcp;`, which is `src/qemu_net/tcp.rs`, and `src/saved_state.rs`
+declares `pub mod snapshot;` and `pub mod wasi;` the same way. `pub` makes
+an item visible outside its module, `pub(crate)` only inside this crate
+(for example `MIGRATE_AFTER_INSTANCES` in `src/wasm.rs`). `#[cfg(...)]`
+compiles code only under a condition: `#[cfg(test)]` marks unit tests (in
+`src/qemu_net.rs`, `src/tab_program.rs` and others).
 
 ### Ownership in one paragraph
 
@@ -113,12 +113,12 @@ kept, the bare `_` is not.
 
 | Tool | What it is | Where it is used |
 |---|---|---|
-| `std::thread::spawn`, `thread::Builder` | Start an OS thread running a closure. The `JoinHandle` can `join()` (wait) or report `is_finished()` | QEMU's thread in `src/app.rs`; vCPU threads in `src/qemu_threads.rs`; compiler threads in `src/qemu_jit.rs`; the profiler's ticker |
+| `std::thread::spawn`, `thread::Builder` | Start an OS thread running a closure. The `JoinHandle` can `join()` (wait) or report `is_finished()` | a tab's program in `src/tab_program.rs`; vCPU threads in `src/qemu_threads.rs`; compiler threads in `src/qemu_jit.rs`; the profiler's ticker |
 | `Arc<T>` | Shared ownership, thread-safe reference counting | `Arc<Mutex<QemuGfxState>>`, the stop flag `Arc<AtomicBool>`, `Arc<Window>` |
 | `Mutex<T>` | A lock around data; `lock()` returns a guard that unlocks when dropped. `lock().unwrap()` panics if a thread panicked while holding it | `GfxEventQueue`, `JitCache` |
-| `AtomicBool`, `AtomicU64`, ... | Integers and flags shared without a lock; `Ordering::Relaxed` is enough for a flag that is polled | `QemuRun::stop`, the profiler's `TICK` |
-| `mpsc` channels | A queue from senders to one receiver | stop signals of the component path (`App::sender`, `event_sender`); jobs for the JIT compiler threads |
-| `Condvar` | Sleep until another thread signals | `host_net_wait` in `src/qemu_net.rs` |
+| `AtomicBool`, `AtomicU64`, ... | Integers and flags shared without a lock; `Ordering::Relaxed` is enough for a flag that is polled | QEMU's stop flag in `QemuTab`, the profiler's `TICK` |
+| `mpsc` channels | A queue from senders to one receiver | jobs for the JIT compiler threads |
+| `Condvar` | Sleep until another thread signals | `host_net_wait` in `src/qemu_net.rs`; a paused component in `ComponentControl::at_epoch()` and a paused core module in `wasm_headless::Control` |
 | `OnceLock`, `thread_local!` | A global set once; a global per thread | settings read from the environment; the profiler's state |
 | `UnsafeCell` + `unsafe impl Sync` | Shared data whose locking the programmer guarantees | `SharedWasi` in `src/qemu_threads.rs` |
 
@@ -175,23 +175,24 @@ them. Every use in m-browser:
 | `spawn_child_window()`, `src/app.rs` | `with_parent_window()` | The parent's raw handle stays valid (the main window lives as long as the app) |
 | `load_qemu_module()`, `src/wasm.rs` | `Module::deserialize_file()`, `Module::deserialize()` | The bytes are machine code wasmtime produced; it cannot verify them. Only the cache written by `precompile_module()` is loaded |
 | `nonzero_runs()`, `src/wasm.rs` | `align_to::<u64>()` | Any bit pattern is a valid `u64` |
+| `is_zero()`, `src/saved_state/snapshot.rs` | `align_to::<u64>()` | The same |
 | `with_guest()`, `with_guest_mut()`, `src/qemu_jit.rs` | `slice::from_raw_parts(_mut)` over shared memory | Other threads may write meanwhile; callers accept a torn read, and QEMU does not touch buffers it hands to the host |
+| `write_guest()`, `read_guest()`, `src/qemu_save.rs` | `ptr::copy_nonoverlapping()`, `slice::from_raw_parts()` over shared memory | In bounds (checked); only called between two steps, when QEMU's main thread, the only user of the monitor buffer, is not running |
 | `SharedWasi`, `src/qemu_threads.rs`; `QemuHostState::wasi_ctx()` | `unsafe impl Sync`, `UnsafeCell::get()` | Only the thread holding the `locked` spin lock uses the WASI context |
-| `src/fill.rs` | `mem::transmute` | Compiled out (the feature is never enabled) |
 
 ## The GUI stack
 
 | Crate | Role | In this code |
 |---|---|---|
 | winit | Creates native windows and delivers events (keys, mouse, resize, redraw) | `App` implements `winit::application::ApplicationHandler`; `main()` runs `EventLoop::run_app()` |
-| egui | *Immediate-mode* UI: code describes the whole UI again on every frame, and a widget reports clicks as it is drawn (`if ui.button("Go").clicked()`); state lives in your own struct (`App`) | `App::handle_redraw()` |
+| egui | *Immediate-mode* UI: code describes the whole UI again on every frame, and a widget reports clicks as it is drawn (`if ui.button("Go").clicked()`); state lives in your own struct (`App`) | `draw_ui()`, called by `App::handle_redraw()` |
 | egui-winit, egui-wgpu | Translate winit events into egui input; draw egui's triangles with wgpu | `EguiRenderer` in `src/egui_tools.rs` |
-| egui_commonmark, pulldown-cmark | Render Markdown with egui; parse Markdown | the page area in `handle_redraw()`, `get_heading()` |
+| egui_commonmark, pulldown-cmark | Render Markdown with egui; parse Markdown | `show_markdown()`, `get_heading()` |
 | wgpu | Portable GPU API (Vulkan, Metal, ...). A *surface* is a window's drawable area; each frame takes a texture from its *swap chain* (`get_current_texture()`), draws, and `present()`s it | `AppState` in `src/app.rs` |
 | softbuffer | Show a CPU-side pixel buffer (`u32` per pixel, `0x00RRGGBB`) in a window, no GPU code | QEMU's screen, `src/qemu_gfx.rs` |
 | raw-window-handle | Common traits for native window handles, so wgpu, softbuffer and wasi-gfx can draw into a winit window | `MyWindowWrapper` in `src/winit_wasi.rs` |
 | pollster | Runs an `async` function to completion on the current thread | `main()`, `App::resumed()` |
-| reqwest (`blocking`) | HTTP client | `navigate()`, `download_wasm()` |
+| reqwest (`blocking`) | HTTP client | `navigate()`, `fetch_wasm()` |
 
 Sizes come as *physical* pixels (real screen pixels) or *logical* pixels
 (physical divided by the display's scale factor, 2 on many high-DPI
@@ -231,7 +232,7 @@ offers. You can list them with `wasm-tools print --skeleton`:
 | | The installed QEMU (multi-threaded build) |
 |---|---|
 | Imports | `env.memory` (shared); `env.host_gfx_*`, `env.host_net_*`, `env.host_main_wake`, `env.host_vcpu_run`; `env.wasi_jit_compile`, `wasi_jit_load_cached`, `wasi_jit_load_async`; `wasi_snapshot_preview1.*` (WASI); `wasi.thread-spawn` |
-| Exports | `memory`, `__indirect_function_table`, `_initialize`, `wasi_qemu_init`, `wasi_qemu_step`, `wasi_qemu_quit`, `wasi_qemu_jit_reset`, `wasi_thread_start`, `wasi_vcpu_enter` |
+| Exports | `memory`, `__indirect_function_table`, `_initialize`, `wasi_qemu_init`, `wasi_qemu_step`, `wasi_qemu_quit`, `wasi_qemu_jit_reset`, `wasi_qemu_buffer`, `wasi_qemu_buffer_size`, `wasi_qemu_monitor`, `wasi_thread_start`, `wasi_vcpu_enter` |
 
 All host imports are described in
 [reference/host-imports.md](reference/host-imports.md).
@@ -259,7 +260,7 @@ the engine must enable it (`Config::wasm_exceptions(true)`).
 
 | Type | What it is | In this code |
 |---|---|---|
-| `Config` | Settings for compiling and running (table below) | `run_wasm_module()`, `Wasm::new()` in `src/wasm.rs` |
+| `Config` | Settings for compiling and running (table below) | `run_wasm_module()`, `ComponentControl::new()` in `src/wasm.rs` |
 | `Engine` | Compiler plus settings; shared, thread-safe | one per QEMU run, plus a second one that only precompiles QEMU optimised |
 | Cranelift | wasmtime's compiler from wasm to machine code | `OptLevel::None` for translation blocks, `Speed` for QEMU's own code |
 | `Module` | Compiled code of a core module (owned by the Engine, reusable). Can be precompiled to bytes (a `.cwasm` file) and loaded later | QEMU, cached as `qemu-<hash>.cwasm` in `$XDG_CACHE_HOME/m-browser/` or `~/.cache/m-browser/` by `load_qemu_module()`; each translation block |
@@ -283,8 +284,15 @@ Configuration used for QEMU (`run_wasm_module()`):
 | `wasm_backtrace_details(Enable)` | Function names and source lines in error traces (turned off while profiling) |
 | `epoch_interruption(true)` | Only with `QEMU_PROFILE` ([12-profiling.md](12-profiling.md)) |
 
-The component runtime (`Wasm::new()`) uses `wasm_component_model(true)`,
-`async_support(true)` and `epoch_interruption(true)`.
+The component runtime (`ComponentControl::new()`, one engine per
+component) uses `wasm_component_model(true)`, `async_support(true)` and
+`epoch_interruption(true)`. *Epochs* are wasmtime's cheap way to reach
+into running wasm code: the code checks a counter on entering a function
+and at the end of each loop iteration, and once the engine's epoch passes
+the Store's deadline, a callback decides (`Store::epoch_deadline_callback`
+returning an `UpdateDeadline`): go on until a later deadline, or trap.
+m-browser uses it to pause and stop a tab's component
+([05-browser-ui.md](05-browser-ui.md#pausing-kind-by-kind)).
 
 **Traps and exits.** A *trap* is wasm's crash (out-of-bounds access,
 `unreachable`, a missed epoch deadline, ...). wasmtime returns it as an

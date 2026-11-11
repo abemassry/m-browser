@@ -62,3 +62,20 @@ oneshot = "0.1"
 wit-bindgen = "0.41"
 callback-future = "0.1"
 bytemuck = "1"
+# Saved states (saved_state.rs): module identity, damage detection, file
+# headers, compressed memory images, and reading a module's structure.
+sha2 = "0.10"
+crc32fast = "1"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+flate2 = "1"
+wasmparser = "0.243"
+# Lets saved_state/wasi.rs call wasmtime-wasi's preview-1 functions; must be
+# the version wasmtime-wasi uses.
+wiggle = { version = "=41.0.4", default-features = false }
+# The browser's session file (app.rs): its tabs and their saved states.
+serde_json = "1"
+
+[dev-dependencies]
+# Tests write their wasm programs as text.
+wat = "1.243"

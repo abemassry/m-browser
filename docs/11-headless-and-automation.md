@@ -3,18 +3,21 @@
 **What this covers.** m-browser's `--qemu-headless` mode (`src/headless.rs`):
 running a QEMU wasm module from a terminal or a script, without a window,
 with screenshots written to a PNG file, text and mouse clicks fed in from
-a schedule or a named pipe, and a clean shutdown after a set time. Read it
-to test QEMU changes, to script the guest, or to understand the qemu-wasi
-test and measurement scripts that are built on it.
+a schedule or a named pipe, pausing and saving QEMU from that pipe,
+resuming a saved checkpoint, and a clean shutdown after a set time. Read
+it to test QEMU changes, to script the guest, or to understand the
+qemu-wasi test and measurement scripts that are built on it.
 
 ## Summary
 
 ```text
 m-browser --qemu-headless [--preopen HOST=GUEST]... <qemu.wasm> [QEMU args...]
+m-browser --qemu-headless [--preopen HOST=GUEST]... --resume <file.wasmsavestate>
 
 QEMU_SNAPSHOT=<file.png>   the screen as a PNG, at most once a second
 QEMU_TYPE=<script>         text typed on a timer
-QEMU_TYPE_FIFO=<path>      text and pointer commands from a named pipe
+QEMU_TYPE_FIFO=<path>      text, pointer, pause and save commands from a named pipe
+QEMU_SAVE_DIR=<dir>        where checkpoints go (default: the working directory)
 QEMU_QUIT_AFTER=<seconds>  quit cleanly after this long
 ```
 
@@ -44,6 +47,10 @@ comes from typist threads instead of winit. Everything QEMU-related in
    (`qemu-system-x86_64`). Unlike the GUI, the runner adds no QEMU
    options, except `-smp` for the multi-threaded build when it is
    missing (`run_wasm_module()` does that).
+5. Or, instead of the module and its arguments, `--resume FILE`: QEMU
+   starts from a checkpoint saved with `!save`, with the module,
+   arguments and preopened directories saved in it
+   ([15-saved-states.md](15-saved-states.md#qemu-checkpoints)).
 
 As in the GUI, `pc-bios` is preopened as `/bios` and `.` as `/data`, both
 relative to the working directory, and `QEMU_*`/`WASI_*` environment
@@ -54,9 +61,9 @@ variables reach QEMU.
 runner stops with an error.
 
 **Pitfall:** the runner takes no disk image lock (that is
-`lock_disk_image()` in the GUI). Two QEMUs on one qcow2 image (QEMU's
-disk image format) corrupt it. Run headless QEMUs on a copy of the image,
-never on the one a GUI may be using.
+`lock_disk_image()` in the GUI, `src/tab_program.rs`). Two QEMUs on one
+qcow2 image (QEMU's disk image format) corrupt it. Run headless QEMUs on a
+copy of the image, never on the one a GUI may be using.
 
 ## Environment variables
 
@@ -64,7 +71,8 @@ never on the one a GUI may be using.
 |---|---|
 | `QEMU_SNAPSHOT=<file.png>` | Write the screen to this PNG at most once a second, through a temporary file renamed into place. Its size is the zoomed frame (see `WASI_GFX_SCALE`) |
 | `QEMU_TYPE=<script>` | Type text on a timer ([below](#qemu_type)) |
-| `QEMU_TYPE_FIFO=<path>` | Type every line written to this named pipe, followed by Enter; lines starting with `!` are pointer commands ([below](#qemu_type_fifo)) |
+| `QEMU_TYPE_FIFO=<path>` | Type every line written to this named pipe, followed by Enter; lines starting with `!` are pointer, pause and save commands ([below](#qemu_type_fifo)) |
+| `QEMU_SAVE_DIR=<dir>` | Where `!save` writes checkpoints, and where disk overlays go (default: the working directory). QEMU must reach it through a preopen |
 | `QEMU_QUIT_AFTER=<seconds>` | After this long (decimals allowed), ask QEMU to quit, as the GUI does when its window closes: power off, close the disk images, at most 10 s |
 
 Times count from the start of m-browser, which includes loading (and on
@@ -98,6 +106,10 @@ writer closes it, so each `echo ... > fifo` works.
 | `!move X Y` | Pointer to (X, Y) |
 | `!click B` | Press and release button B |
 | `!down B`, `!up B` | Press, release button B |
+| `!pause`, `!continue` | Stop the guest, let it run again |
+| `!save` | Write a checkpoint ([15-saved-states.md](15-saved-states.md#qemu-checkpoints)); the guest goes on |
+| `!monitor CMD` | Run QEMU monitor command CMD (as typed at `(qemu)`), and print its output to standard error |
+| `!url ADDRESS` | The keys a web tab sends its Chromium ([05-browser-ui.md](05-browser-ui.md#web-tabs)): Ctrl+L, the address and Enter, all queued at once. For a guest resumed from a web checkpoint, it opens the address |
 
 X and Y are pixels of the zoomed frame, the same pixels as the
 `QEMU_SNAPSHOT` image, so you can measure positions on a snapshot. B is a
@@ -105,6 +117,11 @@ QEMU button code: 0 left, 1 middle, 2 right, 3 wheel up, 4 wheel down.
 Unknown commands are logged and ignored. Pointer positions need an
 absolute pointing device in the guest (`-device qemu-xhci -device
 usb-tablet`).
+
+**Note:** `!pause`, `!save` and `!monitor` reach QEMU through its
+`wasi_qemu_monitor` export, between two steps, not through a console:
+they work with `-monitor none`, need no `WASI_GFX_CONSOLE`, and are
+carried out in order. `!monitor quit` quits QEMU.
 
 **Pitfall:** the path must be a FIFO. A regular file is read to its end,
 reopened at once and typed again, forever. A path that cannot be opened

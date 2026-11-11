@@ -56,6 +56,8 @@ for itself.
 | Give the guest a network (DHCP, DNS, UDP, TCP, ping, port forwarding) | `src/qemu_net.rs`, `src/qemu_net/tcp.rs` | [10-networking.md](10-networking.md) |
 | Run QEMU without a window, scripted | `src/headless.rs` | [11-headless-and-automation.md](11-headless-and-automation.md) |
 | Profile QEMU | `src/qemu_profile.rs` | [12-profiling.md](12-profiling.md) |
+| Run other core wasm modules without a window; pause them, save them to a file, resume them in another process | `src/wasm_headless.rs`, `src/saved_state.rs` | [15-saved-states.md](15-saved-states.md) |
+| Pause QEMU, save checkpoints of it, resume them (several at once) | `src/qemu_save.rs`, `src/headless.rs` | [15-saved-states.md](15-saved-states.md#qemu-checkpoints) |
 
 ## How it relates to qemu-wasi
 
@@ -100,6 +102,7 @@ docs/15-performance.md has the measurements and the tools.
 | Work on the screen, keyboard, mouse | [09-display-and-input.md](09-display-and-input.md) |
 | Work on the network | [10-networking.md](10-networking.md) |
 | Script QEMU or measure it | [11-headless-and-automation.md](11-headless-and-automation.md), [12-profiling.md](12-profiling.md) |
+| Save a running program and resume it later | [15-saved-states.md](15-saved-states.md) |
 | Add a feature | [13-adding-features.md](13-adding-features.md) |
 | Test or debug | [14-testing-and-debugging.md](14-testing-and-debugging.md), [known-issues.md](known-issues.md) |
 | Look up a setting or an import | [reference/environment-variables.md](reference/environment-variables.md), [reference/host-imports.md](reference/host-imports.md) |

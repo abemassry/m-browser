@@ -2,12 +2,12 @@
 
 **What this covers.** Every environment variable m-browser reads: for
 running QEMU (vCPUs, JIT, Store migration, the compiled-module cache), its
-network, its profiler and its headless runner; the standard variables that
-matter; and the rule that passes `QEMU_*` and `WASI_*` variables into
-QEMU. For each: default, accepted values, effect and where the code reads
-it. The variables QEMU itself reads (JIT tiers, time slices, diagnostics,
-display) are documented in the qemu-wasi repository's
-docs/reference/environment-variables.md.
+network, its profiler and its headless runner; for the generic runner of
+other core modules; the standard variables that matter; and the rule that
+passes `QEMU_*` and `WASI_*` variables into QEMU. For each: default,
+accepted values, effect and where the code reads it. The variables QEMU
+itself reads (JIT tiers, time slices, diagnostics, display) are documented
+in the qemu-wasi repository's docs/reference/environment-variables.md.
 
 ## How to set variables
 
@@ -90,8 +90,22 @@ for tests and scripts; the GUI ignores them.
 |---|---|---|---|---|---|
 | `QEMU_SNAPSHOT` | unset | Path of a PNG file | Writes the screen to this file at most once a second, whenever QEMU sends a frame (about once a second even when nothing changes), through a temporary file that is then renamed. The image is the frame as QEMU sends it, magnified by QEMU's `WASI_GFX_SCALE`. Read in the GUI too, but only used where there is no window | `src/qemu_gfx.rs`, `QemuGfxState::new()`; used by `host_gfx_update_framebuffer` in `add_gfx_to_linker()` | [11-headless-and-automation](../11-headless-and-automation.md) |
 | `QEMU_TYPE` | unset | `<secs>:<text>` entries separated by `;` | Types each text at its time, about 60 ms per character, both as key presses for the guest and as text for QEMU's text consoles (the monitor, serial consoles); characters with no key on a US keyboard go as text only. Times count from the runner's start, QEMU's start-up included, and may have fractions; entries are sorted by time. In the text, the two-character sequences `\n`, `\t` and `\e` mean Enter, Tab and Escape, so quote the value with single quotes; a text cannot contain `;`. A malformed entry stops the runner with an error | `src/headless.rs`, `run()`, `spawn_typist()` | [11-headless-and-automation](../11-headless-and-automation.md) |
-| `QEMU_TYPE_FIFO` | unset | Path of a named pipe (`mkfifo`) | Types each line written to the pipe, followed by Enter. Lines starting with `!` are pointer commands: `!move X Y`, `!click B`, `!down B`, `!up B`, with X and Y in pixels of the frame QEMU sends and B a QEMU button number (0 left, 1 middle, 2 right, 3 and 4 wheel up and down). The pipe is opened again after each writer closes it | `src/headless.rs`, `spawn_fifo_typist()`, `pointer_command()` | [11-headless-and-automation](../11-headless-and-automation.md) |
+| `QEMU_TYPE_FIFO` | unset | Path of a named pipe (`mkfifo`) | Types each line written to the pipe, followed by Enter. Lines starting with `!` are commands: pointer commands `!move X Y`, `!click B`, `!down B`, `!up B`, with X and Y in pixels of the frame QEMU sends and B a QEMU button number (0 left, 1 middle, 2 right, 3 and 4 wheel up and down); and `!pause`, `!continue`, `!save` (write a checkpoint), `!monitor CMD` (run a QEMU monitor command, its output on standard error). The pipe is opened again after each writer closes it | `src/headless.rs`, `spawn_fifo_typist()`, `pointer_command()`, `save_command()` | [11-headless-and-automation](../11-headless-and-automation.md), [15-saved-states](../15-saved-states.md#qemu-checkpoints) |
+| `QEMU_SAVE_DIR` | the working directory | Path of a directory, which QEMU must reach through a preopen | Where `!save` writes checkpoints (`.wasmsavestate`) and where QEMU's new disk overlays go, at a save and at a resume; in the GUI too: the web checkpoint and the overlays of web tabs (which are deleted when their tab's QEMU stops). Read when QEMU starts. Outside every preopen: the save fails with `... is not a directory QEMU can reach`, and QEMU goes on. Also passed into QEMU (it starts with `QEMU_`), which ignores it | `src/qemu_save.rs`, `Session::default_save_dir()` | [15-saved-states](../15-saved-states.md#qemu-checkpoints) |
 | `QEMU_QUIT_AFTER` | unset | Seconds, a number that may have fractions | After this long, asks QEMU to quit cleanly (power the guest off, close its disk images), as the GUI does when its window closes; QEMU gets 10 s before it is stopped. Not a number: the runner stops at once with `QEMU_QUIT_AFTER must be a number of seconds`. A negative or infinite value panics the timer thread, and QEMU then keeps running | `src/headless.rs`, `run()` | [11-headless-and-automation](../11-headless-and-automation.md) |
+
+## Generic headless runner
+
+These are for `m-browser --wasm-headless`, which runs core modules other
+than QEMU without a window, and pauses, hibernates and resumes them
+([15-saved-states](../15-saved-states.md)). They are read when the runner
+starts, also by `--resume`. Nothing of m-browser's environment reaches
+the program, except what `--env KEY=VALUE` gives it.
+
+| Variable | Default | Values | Effect | Read in | More |
+|---|---|---|---|---|---|
+| `WASM_CONTROL_FIFO` | unset | Path of a named pipe (`mkfifo`) | Commands, one per line: `pause` (at the next point where the program can stop; its monotonic clock stands still meanwhile), `continue`, `hibernate` (at the next save point: write a `.wasmsavestate` file into the working directory and exit), `quit` (stop without saving). Unknown lines are logged and ignored. The pipe is opened again after each writer closes it; a regular file would be read again and again | `src/wasm_headless.rs`, `run()`, `spawn_control_fifo()` | [15-saved-states](../15-saved-states.md) |
+| `WASM_HIBERNATE_AFTER` | unset | Seconds, a number that may have fractions, 0 or more | Hibernate at the first save point after this long. A program without save points (a command not transformed by Asyncify) declines with a message and runs on. A resumed run with the variable still set hibernates again after that long. Not a number, negative or infinite: the runner stops at once with `WASM_HIBERNATE_AFTER must be a number of seconds` | `src/wasm_headless.rs`, `run()` | [15-saved-states](../15-saved-states.md) |
 
 ## Standard variables
 
@@ -100,7 +114,7 @@ for tests and scripts; the GUI ignores them.
 | `RUST_BACKTRACE` | unset | `1`, `full` | A panic prints the Rust stack. Errors printed in full (`{:?}`), such as `step failed: ...`, also get the Rust stack of where they arose (anyhow; `RUST_LIB_BACKTRACE` controls that part alone). The wasm backtrace of a QEMU trap is printed either way | Rust's standard library, anyhow | [14-testing-and-debugging](../14-testing-and-debugging.md) |
 | `RUST_LOG` | - | - | No effect. m-browser depends on env_logger but never starts it (the call in `Wasm::new()`, `src/wasm.rs`, is commented out), so the log messages of its libraries (wgpu, wasmtime, winit) go nowhere | - | - |
 | `WAYLAND_DISPLAY`, `DISPLAY` | Set by the desktop session | - | winit, the window library, uses Wayland when `WAYLAND_DISPLAY` (or `WAYLAND_SOCKET`) is set and not empty, else X11 when `DISPLAY` is. Unset `WAYLAND_DISPLAY` to force X11 (XWayland) | winit (Linux) | [05-browser-ui](../05-browser-ui.md) |
-| `WASMTIME_BACKTRACE_DETAILS` | unset | `1` | Source lines in the trap reports of wasi-gfx components (the component path, `Wasm::new()`), whose engine follows wasmtime's default. No effect on QEMU, whose engine always has them on (off with `QEMU_PROFILE`) | wasmtime's `Config` | [06-qemu-runner](../06-qemu-runner.md) |
+| `WASMTIME_BACKTRACE_DETAILS` | unset | `1` | Source lines in the trap reports of wasi-gfx components (the component path; `ComponentControl::new()` makes their engines), which follow wasmtime's default. No effect on QEMU, whose engine always has them on (off with `QEMU_PROFILE`) | wasmtime's `Config` | [06-qemu-runner](../06-qemu-runner.md) |
 
 ## Variables passed into QEMU
 

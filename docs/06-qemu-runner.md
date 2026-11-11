@@ -22,16 +22,19 @@ once QEMU has exited.
 app.rs (QEMU's own thread)            headless.rs (--qemu-headless)
                    \                     /
   run_wasm_module(wasm_path, qemu_args, preopen_dirs,
-                  surface, event_queue, stop)
+                  surface, event_queue, stop, saving)
     1. Engine settings; load_qemu_module (compiled once, cached on disk)
     2. does the module import env.memory?  -> multi-threaded build
     3. Linker: WASI, JIT, display, network [, threads]
-    4. WASI context: arguments (+ -smp), QEMU_*/WASI_* variables, preopens
+    4. WASI context: arguments (+ -smp), QEMU_*/WASI_* variables, preopens;
+       a qemu_save::Saver if `saving` is given (headless only, so far)
           |                                       |
   single-threaded build: one Store       multi-threaded build: QemuThreads
           |                                       |
           +---------> run_qemu_reactor <----------+
                       _initialize, wasi_qemu_init, wasi_qemu_step ...
+                      (+ the Saver's monitor commands between steps,
+                       see 15-saved-states.md)
                       (+ migrate_store, single-threaded build only)
 ```
 
@@ -216,8 +219,9 @@ build without `wasi_qemu_quit` is simply dropped.
 are not unmounted, although the qcow2 file stays consistent. For a clean
 guest, shut it down from inside (`poweroff`); QEMU then exits by itself.
 
-**Pitfall:** when the browser quits, `App::shutdown_qemu` waits only 5 s
-for QEMU's thread, less than `QUIT_TIMEOUT`, then the process ends anyway.
+**Pitfall:** when the browser quits, `App::shutdown` waits only 5 s in all
+for the QEMU threads, less than `QUIT_TIMEOUT`, then the process ends
+anyway.
 
 ## Store migration (migrate_store)
 
@@ -334,14 +338,24 @@ from the shared cache and cover all vCPUs.
 ## The component runtime (Wasm)
 
 The top of `src/wasm.rs` runs wasi-gfx components and shares nothing with
-QEMU's path. `Wasm::new(rx)` builds an engine (component model, async,
-epoch interruption), a Linker with wasi-webgpu, wasi-graphics-context,
-wasi-surface and WASI preview 2, and a Store with epoch deadline 1. A
-thread polls `rx` every 100 ms and on a message advances the epoch, which
-makes the running component trap: that is how it is stopped. `run_wasm`
-hands over the window's surface (`create_canvas` takes it), instantiates
-the component as a `wasi:cli` command and calls `run`; `stop_wasm` does
-nothing. See [05-browser-ui.md](05-browser-ui.md).
+QEMU's path. `ComponentControl::new()` builds an engine for one component
+(component model, async, epoch interruption) and the `ProgramClock` that
+will be its monotonic clock. `Wasm::new(&control)` builds a Linker with
+wasi-webgpu, wasi-graphics-context, wasi-surface and WASI preview 2, and a
+Store with epoch deadline 1 and `ComponentControl::at_epoch()` as its
+epoch-deadline callback. `ComponentControl::pause()`, `resume()` and
+`stop()` advance the engine's epoch from the UI thread; at its next check
+the component calls `at_epoch()`, which waits while it is paused and
+answers `UpdateDeadline::Interrupt` once it is stopped, so that it traps.
+`run_wasm` hands over the window's surface (`create_canvas` takes it),
+instantiates the component as a `wasi:cli` command, calls `run`, and
+returns its errors. See
+[05-browser-ui.md](05-browser-ui.md#pausing-kind-by-kind).
+
+**Note:** `run_wasm_module()` takes a `Saving` (`src/qemu_save.rs`) to let
+QEMU be paused and saved. Only a reactor build stops between main-loop
+steps, so an older `_start` build given one runs without it, with a note
+on stderr; resuming a checkpoint with it fails.
 
 ## Troubleshooting
 

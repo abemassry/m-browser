@@ -52,7 +52,7 @@ and package manager; a *crate* is a package. Distribution packages of
 `rustc` are usually too old. Why 1.91: Cargo.lock pins smoltcp 0.14.0,
 which declares `rust-version = "1.91"` (wasmtime 41.0.4: 1.90), and Cargo
 refuses older compilers; `File::try_lock()` in `lock_disk_image()`
-(`src/app.rs`) alone would need 1.89. The last build used rustc 1.91.1
+(`src/tab_program.rs`) alone would need 1.89. The last build used rustc 1.91.1
 (`target/.rustc_info.json`). Newer releases should work but are untried;
 if one fails, run `rustup toolchain install 1.91.1`, then build with
 `cargo +1.91.1 build --release`.
@@ -79,7 +79,8 @@ if one fails, run `rustup toolchain install 1.91.1`, then build with
    is an Alpine Linux image with Xorg, the Fluxbox window manager and
    Chromium, which logs in automatically (qemu-wasi's
    docs/16-guest-image.md). Name and place are fixed (`QEMU_DISK_IMAGE` in
-   `src/app.rs`, QEMU's `-drive` option); `.gitignore` keeps it out of git.
+   `src/tab_program.rs`, QEMU's `-drive` option); `.gitignore` keeps it
+   out of git.
 
    ```sh
    # from the m-browser directory
@@ -122,18 +123,22 @@ for this guide).
 ```
 
 **Pitfall:** always start it from the m-browser directory. It opens
-`./m.qcow2` and `./pc-bios` relative to the working directory and writes
-`./downloaded.wasm` there (a copy of the last `.wasm` page; gitignored).
+`./m.qcow2` and `./pc-bios` relative to the working directory, and writes
+downloaded `.wasm` pages there as `downloaded-<hash>.wasm` (gitignored).
 
 A window titled "M" opens (it asks for 3840x2160 pixels; window managers
-usually shrink it). At the top: a menu (theme, "Quit"), back, forward, the
-address bar and Go (`>>`); on the left the tabs and `+`; at the bottom the
-status. The address bar shows the project README on
-raw.githubusercontent.com, but nothing is fetched until you press Enter or
-Go: until then the page is empty and the status says "Loading...". Local
-Markdown works too, e.g. `file:///<path of m-browser>/pages/SECOND_PAGE.md`
+usually shrink it). At the top: a menu (theme, "Reload", "Quit"), back,
+forward, the address bar and Go (`>>`); on the left the tabs, each with a
+close button, and `+`; at the bottom the status. The address bar shows
+the project README on raw.githubusercontent.com, but nothing is fetched
+until you press Enter or Go. Local Markdown works too, e.g.
+`file:///<path of m-browser>/pages/SECOND_PAGE.md`
 ([05-browser-ui.md](05-browser-ui.md)). Pages load on the UI thread, so
 the window freezes until the server answers.
+
+Each tab keeps what it shows: a page keeps its scroll position, and a
+`.wasm` page's program keeps running in its tab. While you are in another
+tab it is paused, and it goes on where it was when you come back.
 
 ## Running QEMU
 
@@ -142,17 +147,20 @@ the window freezes until the server answers.
    `file://` followed by the absolute path of `qemu-system-x86_64.wasm`
    (hence three slashes). In the m-browser directory,
    `echo "file://$PWD/qemu-system-x86_64.wasm"` prints it.
-3. Press Enter (or Go). m-browser copies the module to `downloaded.wasm`,
-   opens a 1080x720 child window inside the main window, right of the tabs
-   and below the toolbar, and starts QEMU on a thread of its own ([its
-   arguments](05-browser-ui.md#from-the-address-bar-to-a-running-qemu)).
+3. Press Enter (or Go). m-browser recognizes QEMU by its imports, opens
+   a child window covering the page area (right of the tabs, between the
+   toolbar and the status bar), and starts QEMU on a thread of its own
+   ([its arguments](05-browser-ui.md#from-the-address-bar-to-a-running-qemu)).
+   The guest's screen is scaled to fit the window.
+   Switching to another tab pauses QEMU; only one tab at a time can run
+   QEMU on `m.qcow2`.
 
 What to expect on the development machine (20 hardware threads, the
 multi-threaded QEMU with 4 virtual CPUs):
 
 | After Enter | QEMU's window | Terminal |
 |---|---|---|
-| At once | Empty | `[detect] ... is_core=true`, `[qemu] [...] Engine created` |
+| At once | Empty | `[tab <id>] .../qemu-system-x86_64.wasm: Qemu module`, `[qemu] [...] Engine created` |
 | First start of a QEMU build only: about 1 s here (reported, not re-measured), longer on smaller machines | Empty | `compiling QEMU's module with optimizations (done once, then cached)...`, then `compiled in N s; caching it in .../m-browser/qemu-<hash>.cwasm` |
 | Seconds later | Text-mode boot screens (firmware, boot loader, Linux) | `Multi-threaded QEMU: one thread per vCPU`, `4 vCPUs (QEMU_SMP)` (2 on hosts with fewer than 8 CPUs), `Running`, `[qemu-gfx] host_gfx_init(...)` |
 | About 2.5 minutes | The Alpine desktop (Fluxbox) | |
@@ -165,9 +173,9 @@ number of virtual CPUs are environment variables, e.g.
 `QEMU_SMP=2 ./target/release/m-browser`
 ([reference/environment-variables.md](reference/environment-variables.md)).
 
-**Note:** the child window keeps its size, 1080x720 logical pixels. The
-guest's X screen is 1280x800, so on a display with scale factor 1 its right
-and bottom edges are cut off ([details](09-display-and-input.md#pitfalls)).
+**Note:** the guest's screen keeps its proportions when scaled to the
+window, with black bars beside or below it; text looks uneven when the
+factor is not a whole number ([details](09-display-and-input.md#pitfalls)).
 
 ### Keyboard and mouse
 
@@ -199,6 +207,28 @@ others (Alt+Tab, Super, ...) before m-browser sees them.
 After a power cut the guest's file systems replay their journals and
 Chromium may offer to restore its pages; both are normal. To check the
 image, with m-browser closed: `qemu-img check m.qcow2` (`qemu-utils`).
+
+## Web pages
+
+Any address that is neither a `.wasm` module nor Markdown (such as
+`example.com`) opens in a web tab: Chromium, running in QEMU. Every web
+tab starts from one saved moment, the *web checkpoint*, which you make
+once:
+
+1. Close any tab that runs `qemu-system-x86_64.wasm` (the setup copies
+   `m.qcow2`, which must not be in use).
+2. Menu: **Set up web tabs**. A "Web setup" tab copies `m.qcow2` to
+   `m-web-<time>.qcow2` (your `m.qcow2` is only read) and boots the copy.
+3. After five minutes or so, Chromium waits at `about:blank`. Menu:
+   **Save web checkpoint**. It takes a few seconds and about 0.9 GB.
+4. Close the setup tab.
+
+Now enter an address in any tab. Its QEMU resumes from the checkpoint in
+about 2 s, and m-browser types the address into Chromium; the first page
+can take up to a minute while QEMU translates Chromium's code again.
+When you quit, the tabs are kept in `m-browser-session.json`; at the next
+start only the focused tab loads, the others when you open them
+([05-browser-ui.md](05-browser-ui.md#web-tabs)).
 
 ## Running QEMU headless
 
@@ -246,13 +276,17 @@ the [host interface](reference/host-imports.md) must match.
 
 ```sh
 # from the m-browser directory
-cargo test --release --offline qemu_net
+cargo test --release --offline
 ```
 
 This builds a test version of m-browser (slow the first time) and runs its
-11 unit tests, all for the guest's network; they need no network access
-and no privileges, and end with `test result: ok. 11 passed`. There is no
-automated GUI test: before committing anything that reaches QEMU, do the
+50 unit tests: 11 for the guest's network, 28 for saved states and the
+text pages of core modules, 6 for tabs (telling modules and addresses
+apart, pausing a component's wasm code, the session file, cleaning up web
+disks), and 5 for QEMU's display and keys. They need no network access
+and no privileges, and end with `test result: ok. 50 passed`. There is no
+automated GUI test: before committing anything that reaches QEMU or the
+tabs, do the
 [smoke test](14-testing-and-debugging.md#smoke-test-of-the-gui). QEMU's
 instruction test (`make test`) is in qemu-wasi.
 

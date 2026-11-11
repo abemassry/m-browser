@@ -1,4 +1,9 @@
 /target
 .idea/
 downloaded.wasm
+downloaded-*.wasm
 m.qcow2
+*.qcow2
+m-browser-session.json
+*.wasmsavestate
+.claude/settings.local.json

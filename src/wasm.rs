@@ -1,11 +1,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::error::Error as StdError;
 
 use anyhow::Context;
 // use clap::Parser;
-use futures::executor::block_on;
 // use wasi_frame_buffer_wasmtime::WasiFrameBufferView;
 use wasi_graphics_context_wasmtime::WasiGraphicsContextView;
 use wasi_surface_wasmtime::{Surface, SurfaceDesc, WasiSurfaceView};
@@ -14,18 +12,15 @@ use wasi_webgpu_wasmtime::reexports::{wgpu_core, wgpu_types};
 
 use wasmtime::{
     component::{Component, Linker},
-    Config, Engine, Store,
+    Config, Engine, Store, UpdateDeadline,
 };
 
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi_io::IoView;
 
-use winit::window::Window;
-
-use crate::winit_wasi::MyWindowWrapper;
 use crate::qemu_jit;
 use crate::qemu_gfx;
+use crate::saved_state::wasi::ProgramClock;
 
 // #[derive(clap::Parser, Debug)]
 // struct RuntimeArgs {
@@ -59,10 +54,10 @@ struct HostState {
 
 impl HostState {
     // fn new(main_thread_proxy: wasi_surface_wasmtime::WasiWinitEventLoopProxy) -> Self {
-    fn new() -> Self {
+    fn new(clock: ProgramClock) -> Self {
         Self {
             table: ResourceTable::new(),
-            ctx: WasiCtxBuilder::new().inherit_stdio().build(),
+            ctx: WasiCtxBuilder::new().inherit_stdio().monotonic_clock(clock).build(),
             wgpu_instance: Arc::new(wgpu_core::global::Global::new(
                 "webgpu",
                 &wgpu_types::InstanceDescriptor {
@@ -145,6 +140,102 @@ impl WasiSurfaceView for HostState {
 // }
 
 
+/// Pauses, resumes and stops a wasi-gfx component, from any thread.
+///
+/// A component runs on a thread of its own, either inside its wasm code or
+/// waiting in a host call, usually for its next animation frame. Wasmtime's
+/// *epochs* reach into the wasm code: each component has an engine of its
+/// own, and incrementing that engine's epoch makes the component's code
+/// call `at_epoch` at its next check (wasmtime checks on entering a
+/// function and at the end of each loop iteration). There a paused
+/// component waits, and a stopped one traps. A component waiting for a
+/// frame needs no help: it gets no frames while paused (see
+/// `tab_program::ComponentTab`).
+///
+/// Its monotonic clock is a `ProgramClock`, which stands still while it is
+/// paused, so that an animation goes on from where it stopped instead of
+/// jumping ahead by the time the tab was in the background.
+pub struct ComponentControl {
+    engine: Engine,
+    clock: ProgramClock,
+    state: Mutex<RunState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct RunState {
+    paused: bool,
+    stopped: bool,
+}
+
+impl ComponentControl {
+    /// A control with a new engine for one component.
+    pub fn new() -> anyhow::Result<Arc<Self>> {
+        let mut config = Config::default();
+        config.wasm_component_model(true);
+        config.async_support(true);
+        config.epoch_interruption(true);
+        Ok(Arc::new(ComponentControl {
+            engine: Engine::new(&config)?,
+            clock: ProgramClock::new(),
+            state: Mutex::new(RunState::default()),
+            changed: Condvar::new(),
+        }))
+    }
+
+    /// Pause the component at its next epoch check; its clock stops now.
+    pub fn pause(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.paused || state.stopped {
+            return;
+        }
+        state.paused = true;
+        self.clock.pause();
+        drop(state);
+        self.engine.increment_epoch();
+    }
+
+    pub fn resume(&self) {
+        let mut state = self.state.lock().unwrap();
+        if !state.paused {
+            return;
+        }
+        state.paused = false;
+        self.clock.resume();
+        self.changed.notify_all();
+    }
+
+    /// Make the component trap at its next epoch check, paused or not.
+    pub fn stop(&self) {
+        self.state.lock().unwrap().stopped = true;
+        self.changed.notify_all();
+        self.engine.increment_epoch();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.state.lock().unwrap().paused
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.state.lock().unwrap().stopped
+    }
+
+    /// Wasmtime calls this when the component's code reaches its epoch
+    /// deadline: wait while paused, then go on until the next increment,
+    /// or trap if stopped.
+    fn at_epoch(&self) -> UpdateDeadline {
+        let mut state = self.state.lock().unwrap();
+        while state.paused && !state.stopped {
+            state = self.changed.wait(state).unwrap();
+        }
+        if state.stopped {
+            UpdateDeadline::Interrupt
+        } else {
+            UpdateDeadline::Continue(1)
+        }
+    }
+}
+
 pub struct Wasm {
     engine: Engine,
     linker: Linker<HostState>,
@@ -152,18 +243,15 @@ pub struct Wasm {
     surface: Arc<Mutex<Option<Surface>>>,
 }
 impl Wasm {
-    pub fn new(rx: mpsc::Receiver<()>) -> anyhow::Result<Wasm> {
+    /// A runtime for one component, controlled by `control`.
+    pub fn new(control: &Arc<ComponentControl>) -> anyhow::Result<Wasm> {
         // env_logger::builder()
         //     .filter_level(log::LevelFilter::Info)
         //     .init();
 
         // let args = RuntimeArgs::parse();
 
-        let mut config = Config::default();
-        config.wasm_component_model(true);
-        config.async_support(true);
-        config.epoch_interruption(true);
-        let engine = Engine::new(&config)?;
+        let engine = control.engine.clone();
         let mut linker: Linker<HostState> = Linker::new(&engine);
 
         wasi_webgpu_wasmtime::add_to_linker(&mut linker)?;
@@ -184,24 +272,15 @@ impl Wasm {
         // let (main_thread_loop, main_thread_proxy) =
         //     wasi_surface_wasmtime::create_wasi_winit_event_loop();
         // wasi_surface_wasmtime:
-        let host_state = HostState::new();
+        let host_state = HostState::new(control.clock.clone());
         let surface = Arc::clone(&host_state.surface);
 
         let mut store = Store::new(&engine, host_state);
+        // The first increment of the epoch (a pause or a stop) reaches the
+        // deadline; at_epoch then sets the next one.
         store.set_epoch_deadline(1);
-
-        // main_thread_loop.run();
-        let e2 = engine.clone();
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if rx.try_recv().is_ok() {
-                    println!("Exiting epoch thread");
-                    e2.increment_epoch();
-                    break;
-                }
-            }
-        });
+        let at = Arc::clone(control);
+        store.epoch_deadline_callback(move |_| Ok(at.at_epoch()));
 
         Ok(Wasm {
             engine,
@@ -211,54 +290,26 @@ impl Wasm {
         })
     }
 
-    pub async fn run_wasm(&mut self, wasm_path: String, surface: Surface) -> anyhow::Result<()> {
+    /// Run the component's `run` export, drawing into `surface`, until it
+    /// returns or fails. A stopped component fails with a trap (see
+    /// `ComponentControl::stop`).
+    pub async fn run_wasm(&mut self, wasm_path: &str, surface: Surface) -> anyhow::Result<()> {
+        self.surface
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the surface's lock is poisoned"))?
+            .replace(surface);
 
-        //self.surface.lock().unwrap().replace(surface);
-        match self.surface.lock() {
-            Ok(mut guard) => guard.replace(surface),
-            Err(_) => {
-                println!("Failed to lock surface mutex:");
-                return Err(anyhow::anyhow!("Failed to lock surface mutex"));
-            }
-        };
-        // let wasm_path = format!("./triangle.wasm");
-
-        let component =
-            Component::from_file(&self.engine, &wasm_path).context("Component file not found")?;
-
-        // let instance = Example::instantiate_async(&mut self.store, &component, &self.linker)
-        //     .await
-        //     .unwrap();
-
-
+        let component = Component::from_file(&self.engine, wasm_path)
+            .with_context(|| format!("cannot load the component {wasm_path}"))?;
         let instance =
             wasmtime_wasi::p2::bindings::Command::instantiate_async(&mut self.store, &component, &self.linker)
                 .await
-                .unwrap();
-
-
-        // tokio::spawn(async move {
-        match instance.wasi_cli_run().call_run(&mut self.store).await.context("failed to invoke `run` function") {
-            Ok(Ok(())) => println!("Wasm run completed successfully"),
-            Ok(Err(trap)) => println!("Wasm run trapped: {:?}", trap),
-            Err(e) => println!("Error invoking wasm run: {}", e),
-        };
-            //instance.wasi_cli_run().call_run(&mut self.store)
-            //    .await
-            //    .context("failed to invoke `run` function")
-            //    .unwrap()
-            //    .unwrap();
-
-        // });
-
-        Ok(())
-    }
-
-    pub async fn stop_wasm(&mut self) -> anyhow::Result<()> {
-        println!("Stopping wasm");
-        // self.store.data_mut().surface_proxy = None;
-        //self.store.data_mut().surface.lock().unwrap().take();
-        Ok(())
+                .context("cannot instantiate the component")?;
+        match instance.wasi_cli_run().call_run(&mut self.store).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(())) => anyhow::bail!("the component's run function returned an error"),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -281,6 +332,7 @@ impl Wasm {
 /// `surface`    — optional wasi_surface for display output (None = headless / -nographic)
 /// `event_queue` — shared event queue for injecting input events from the main thread
 /// `stop`       — when set, QEMU quits cleanly and this returns (QEMU reactor builds)
+/// `saving`     — lets QEMU be paused, saved and resumed (qemu_save.rs; reactor builds)
 pub fn run_wasm_module(
     wasm_path: &str,
     qemu_args: &[&str],
@@ -288,6 +340,7 @@ pub fn run_wasm_module(
     surface: Option<wasi_surface_wasmtime::Surface>,
     event_queue: qemu_gfx::GfxEventQueue,
     stop: Option<Arc<AtomicBool>>,
+    saving: Option<crate::qemu_save::Saving>,
 ) -> anyhow::Result<()> {
     use qemu_jit::{QemuHostState, QemuJitState};
     use std::time::Instant;
@@ -381,6 +434,9 @@ pub fn run_wasm_module(
         args.push(smp.to_string());
     }
     wasi_builder.args(&args);
+    let saver = saving
+        .map(|saving| crate::qemu_save::Saver::for_launch(wasm_path, &args, preopen_dirs, threaded, saving))
+        .transpose()?;
 
     // Forward QEMU's tuning/debug knobs (WASI_DEBUG, WASI_GFX_SCALE,
     // QEMU_DUMP_AT, ...) into the sandbox. Only these prefixes are passed so
@@ -428,7 +484,7 @@ pub fn run_wasm_module(
         println!("[qemu] [{:>7.3}s] Instantiating module...", t0.elapsed().as_secs_f64());
         let instance = threads.instantiate(&mut store).context("failed to instantiate QEMU module")?;
         println!("[qemu] [{:>7.3}s] Module instantiated", t0.elapsed().as_secs_f64());
-        return run_qemu_reactor(store, instance, &linker, &module, t0, stop, true);
+        return run_qemu_reactor(store, instance, &linker, &module, t0, stop, saver, true);
     }
     println!("[qemu] [{:>7.3}s] Linker configured", t0.elapsed().as_secs_f64());
 
@@ -477,7 +533,15 @@ pub fn run_wasm_module(
     // Reactor builds (wasi_qemu_init/wasi_qemu_step exports) are driven one
     // main-loop iteration at a time; see run_qemu_reactor.
     if instance.get_func(&mut store, "wasi_qemu_step").is_some() {
-        return run_qemu_reactor(store, instance, &linker, &module, t0, stop, false);
+        return run_qemu_reactor(store, instance, &linker, &module, t0, stop, saver, false);
+    }
+    // Only a reactor build stops between main-loop steps, where m-browser
+    // can pause and save it. An older `_start` build still runs, without.
+    if let Some(saver) = saver {
+        if saver.is_resuming() {
+            anyhow::bail!("{wasm_path} cannot resume a checkpoint: it is not a QEMU reactor build");
+        }
+        eprintln!("[qemu] note: {wasm_path} is not a QEMU reactor build: it cannot be paused or saved");
     }
 
     // Get and call _start
@@ -647,6 +711,7 @@ fn run_qemu_reactor(
     module: &wasmtime::Module,
     t0: std::time::Instant,
     stop: Option<Arc<AtomicBool>>,
+    mut saver: Option<crate::qemu_save::Saver>,
     threaded: bool,
 ) -> anyhow::Result<()> {
     println!("[qemu] [{:>7.3}s] Initializing (reactor)...", t0.elapsed().as_secs_f64());
@@ -674,6 +739,9 @@ fn run_qemu_reactor(
         anyhow::bail!("wasi_qemu_init returned {rc}");
     }
     println!("[qemu] [{:>7.3}s] Running", t0.elapsed().as_secs_f64());
+    if let Some(saver) = &mut saver {
+        saver.after_init(&mut store, &instance).context("cannot resume the checkpoint")?;
+    }
 
     let mut step = instance.get_typed_func::<(), i32>(&mut store, "wasi_qemu_step")?;
     let mut next_map_check = MAP_CHECK_INTERVAL;
@@ -720,6 +788,9 @@ fn run_qemu_reactor(
             return Ok(());
         }
 
+        if let Some(saver) = &mut saver {
+            saver.between_steps(&mut store, &instance);
+        }
         if let Some(last) = &mut last_jit_report {
             if last.elapsed() >= std::time::Duration::from_secs(60) {
                 *last = std::time::Instant::now();
@@ -903,4 +974,76 @@ fn nonzero_runs(data: &[u8], dense_below: usize) -> Vec<(usize, Vec<u8>)> {
         .into_iter()
         .map(|(start, end)| (start, data[start..end].to_vec()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    /// The mechanism behind pausing a component, on a component's engine
+    /// and store setup: an endless loop that counts through a host call
+    /// stops counting while paused, its clock stands still, and a stop
+    /// makes it trap.
+    #[test]
+    fn epochs_pause_resume_and_stop_running_wasm() {
+        let control = ComponentControl::new().unwrap();
+        let module = wasmtime::Module::new(
+            &control.engine,
+            wat::parse_str(
+                r#"(module (import "host" "tick" (func $tick))
+                     (func (export "run") (loop $again (call $tick) (br $again))))"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let ticks = Arc::new(AtomicU64::new(0));
+        let mut linker: wasmtime::Linker<()> = wasmtime::Linker::new(&control.engine);
+        let counter = ticks.clone();
+        linker
+            .func_wrap("host", "tick", move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        let mut store = Store::new(&control.engine, ());
+        store.set_epoch_deadline(1);
+        let at = Arc::clone(&control);
+        store.epoch_deadline_callback(move |_| Ok(at.at_epoch()));
+        let run = std::thread::spawn(move || {
+            pollster::block_on(async {
+                let instance = linker.instantiate_async(&mut store, &module).await?;
+                let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
+                run.call_async(&mut store, ()).await
+            })
+        });
+
+        let count = || ticks.load(Ordering::Relaxed);
+        let wait_for = |what: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !what() {
+                assert!(std::time::Instant::now() < deadline, "timed out");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait_for(&|| count() > 1000);
+
+        control.pause();
+        std::thread::sleep(Duration::from_millis(50));
+        let (paused_at, clock_at) = (count(), control.clock.now_ns());
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(count(), paused_at, "no wasm runs while paused");
+        assert_eq!(control.clock.now_ns(), clock_at, "the clock stands still while paused");
+        assert!(control.is_paused());
+
+        control.resume();
+        wait_for(&|| count() > paused_at + 1000);
+        assert!(control.clock.now_ns() > clock_at);
+
+        control.pause();
+        control.stop();
+        let error = run.join().unwrap().expect_err("a stopped program traps");
+        assert_eq!(error.downcast_ref::<wasmtime::Trap>(), Some(&wasmtime::Trap::Interrupt), "{error:?}");
+        assert!(control.is_stopped());
+    }
 }

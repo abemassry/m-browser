@@ -22,7 +22,8 @@ the qemu-wasi repository's docs/reference/host-interface.md.
             wasi_snapshot_preview1.* -> wasmtime-wasi (5 replaced in
                                         qemu_threads.rs, threaded build)
   exports:  _initialize, wasi_qemu_init, wasi_qemu_step, wasi_qemu_quit,
-            wasi_qemu_jit_reset, memory, __indirect_function_table,
+            wasi_qemu_jit_reset, wasi_qemu_buffer, wasi_qemu_buffer_size,
+            wasi_qemu_monitor, memory, __indirect_function_table,
             wasi_vcpu_enter, wasi_thread_start (threaded build)
 ```
 
@@ -158,6 +159,9 @@ in the single-threaded build wasmtime-wasi's own versions are used.
 | `wasi_qemu_step` | `() -> i32` | both | `run_qemu_reactor` | In a loop: one main-loop iteration. -1 = go on, otherwise the exit status |
 | `wasi_qemu_quit` | `() -> ()` | both | `run_qemu_reactor` | Once, when asked to stop: request a clean shutdown (the following steps perform it) |
 | `wasi_qemu_jit_reset` | `() -> ()` | both | `migrate_store` | After each store migration (single-threaded build only): forget every TB handle |
+| `wasi_qemu_buffer` | `() -> i32` | both | `qemu_save::monitor` | The address of a 64 KiB buffer in QEMU's memory, for monitor commands and their output |
+| `wasi_qemu_buffer_size` | `() -> i32` | both | `qemu_save::monitor` | That buffer's size |
+| `wasi_qemu_monitor` | `(i32) -> i32` | both | `qemu_save::monitor`, between two steps | Run the monitor command of that length written in the buffer, as typed at `(qemu)`; its output replaces it, cut at the buffer's size. Returns the output's full length, or -1 (length out of range, or QEMU refused it). Missing in builds before checkpoints: saving then reports `... has no wasi_qemu_monitor export` |
 | `wasi_vcpu_enter` | `(i32, i32, i32) -> i32` | threaded | `QemuThreads::run_vcpu` | Repeatedly, per vCPU: `(stack_top, tls_base, flags)`, flag 1 = new Store; one vCPU loop iteration; 0 = go on, otherwise unplugged |
 | `wasi_thread_start` | `(i32, i32) -> ()` | threaded | `QemuThreads::spawn` | Once per new thread: `(id, start_arg)`; runs the thread's function |
 | `memory` | memory | both | wasmtime-wasi's functions; `run_wasm_module`, `migrate_store` | wasmtime-wasi finds the caller's memory through this export (which is why the threaded build re-exports its imported memory, `--export-memory`). Single-threaded build: also kept as `guest_memory` and copied at each migration |

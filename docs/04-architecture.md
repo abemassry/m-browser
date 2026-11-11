@@ -1,12 +1,13 @@
 # Architecture: a map of m-browser
 
 **What this covers.** Which source file does what, and which chapter
-explains it in depth; the two run modes (GUI and headless) and the two QEMU
-flavors (single-threaded and multi-threaded); the threads that exist while
-QEMU runs, and the wasmtime Stores they use; how data flows (startup, one
-main-loop step, a translation block, a frame, a key press, a network
-packet, shutdown); who owns which state, why the main design decisions were
-made, and where to start for common tasks.
+explains it in depth; the run modes (GUI, headless QEMU, generic
+headless) and the two QEMU flavors (single-threaded and multi-threaded);
+the threads that exist while QEMU runs, and the wasmtime Stores they use;
+how data flows (startup, one main-loop step, a translation block, a
+frame, a key press, a network packet, shutdown); who owns which state,
+why the main design decisions were made, and where to start for common
+tasks.
 
 This chapter is a map, not a manual: every part has its own chapter, linked
 from the tables below. QEMU's side of the interface (how QEMU itself was
@@ -49,7 +50,7 @@ cleanly and to move QEMU into a fresh Store when compiled code piles up.
  | QEMU thread                                            src/wasm.rs |
  |   run_wasm_module -> run_qemu_reactor                              |
  |   Store<QemuHostState> holding QEMU's Instance                     |
- |   loop { wasi_qemu_step(); maybe migrate_store() }                 |
+ |   loop { wasi_qemu_step(); saver; maybe migrate_store() }          |
  +--------------------------------------------------------------------+
         |  QEMU's code calls host imports (functions in the Linker)
         v
@@ -82,12 +83,12 @@ a separate, much smaller path through `Wasm` in `src/wasm.rs` and
 
 | File | Responsibility | Key types and functions | Chapter |
 |---|---|---|---|
-| `src/main.rs` | Entry point: headless mode or the winit event loop | `main`, `run` | [05](05-browser-ui.md), [11](11-headless-and-automation.md) |
-| `src/app.rs` | The browser: windows, tabs, pages, starting and stopping QEMU, routing input | `App`, `AppState`, `Tab`, `QemuRun`, `lock_disk_image`, `stop_qemu`, `shutdown_qemu` | [05](05-browser-ui.md) |
+| `src/main.rs` | Entry point: one of the two headless runners, or the winit event loop | `main`, `run` | [05](05-browser-ui.md), [11](11-headless-and-automation.md), [15](15-saved-states.md) |
+| `src/app.rs` | The browser: the main window, tabs and their history, pages, the UI, child windows, web tabs and the web checkpoint, the session file | `App`, `AppState`, `Tab`, `Action`, `draw_ui`, `page_kind`, `fetch_wasm`, `start_program`, `SessionFile` | [05](05-browser-ui.md) |
+| `src/tab_program.rs` | A tab's program: QEMU, a component or another core module; pausing it while its tab is in the background; QEMU's arguments and disk lock; routing input to it | `TabProgram`, `QemuTab`, `ComponentTab`, `CoreTab`, `module_kind`, `lock_disk_image` | [05](05-browser-ui.md#a-tabs-program) |
 | `src/egui_tools.rs` | egui drawn with wgpu | `EguiRenderer` | [05](05-browser-ui.md) |
-| `src/fill.rs` | Painting a window with a solid color through softbuffer | `fill_window` | [05](05-browser-ui.md) |
 | `src/winit_wasi.rs` | A winit window as a wasi-gfx surface | `MyWindowWrapper` | [05](05-browser-ui.md), [09](09-display-and-input.md) |
-| `src/wasm.rs` | Running wasm: the component runtime and the QEMU runner | `Wasm`, `run_wasm_module`, `load_qemu_module`, `run_qemu_reactor`, `migrate_store` | [06](06-qemu-runner.md) |
+| `src/wasm.rs` | Running wasm: the component runtime and the QEMU runner | `Wasm`, `ComponentControl`, `run_wasm_module`, `load_qemu_module`, `run_qemu_reactor`, `migrate_store` | [06](06-qemu-runner.md) |
 | `src/qemu_jit.rs` | Translation blocks to native code; the data of every QEMU Store | `JitCache`, `BackgroundCompiler`, `QemuJitState`, `QemuHostState`, `GuestMem`, `with_guest`, `add_jit_to_linker` | [07](07-jit-host.md) |
 | `src/qemu_threads.rs` | wasi-threads for the multi-threaded QEMU | `QemuThreads`, `SharedWasi`, `run_vcpu`, `add_threads_to_linker` | [08](08-threads.md) |
 | `src/qemu_gfx.rs` | QEMU's screen and input | `QemuGfxState`, `GfxEventQueue`, `InputEvent`, `add_gfx_to_linker` | [09](09-display-and-input.md) |
@@ -95,30 +96,44 @@ a separate, much smaller path through `Wasm` in `src/wasm.rs` and
 | `src/qemu_net.rs` | The guest's network: ARP, DHCP, DNS, UDP, ICMP, port forwarding | `VirtualNet`, `Shared`, `Stack::run`, `add_net_to_linker` | [10](10-networking.md) |
 | `src/qemu_net/tcp.rs` | TCP: a NAT built on smoltcp | | [10](10-networking.md) |
 | `src/qemu_profile.rs` | Sampling profiler of QEMU | `configure`, `start`, `attach`, `time_host`, `HostWork` | [12](12-profiling.md) |
-| `src/headless.rs` | `--qemu-headless`: QEMU without a window | `run` | [11](11-headless-and-automation.md) |
+| `src/headless.rs` | `--qemu-headless`: QEMU without a window; resuming a checkpoint; the FIFO's commands | `run`, `pointer_command`, `save_command` | [11](11-headless-and-automation.md) |
+| `src/qemu_save.rs` | Pausing QEMU, its checkpoints (QEMU's migration into a saved-state file, frozen disks) and resuming them | `monitor`, `QemuControl`, `Request`, `Saving`, `Saver`, `Session`, `prepare_resume` | [15](15-saved-states.md#qemu-checkpoints) |
+| `src/wasm_headless.rs` | Any other core module: `--wasm-headless` without a window, and the same code in a tab with a text page; pause, hibernate, resume | `run`, `start`, `resume`, `Control`, `Program`, `OutputPage` | [15](15-saved-states.md) |
+| `src/saved_state.rs` | Saved-state files: names, header, sections and their checks | `Header`, `StateWriter`, `StateReader`, `file_name` | [15](15-saved-states.md) |
+| `src/saved_state/snapshot.rs` | The wasm state of a core module's instance: export injection, save, restore; Asyncify's buffer | `prepare`, `Layout`, `save`, `Restore` | [15](15-saved-states.md) |
+| `src/saved_state/wasi.rs` | WASI preview 1 in saved states: journal of open files, reopening them, the program's clock | `add_to_linker`, `FileJournal`, `save`, `restore`, `ProgramClock` | [15](15-saved-states.md) |
 
 The full list of imports and exports is in
 [reference/host-imports.md](reference/host-imports.md); every environment
 variable is in
 [reference/environment-variables.md](reference/environment-variables.md).
 
-## Two run modes
+## Three run modes
 
 `main` looks at its first argument:
 
-- **GUI** (`m-browser`): the winit event loop and `App`. QEMU starts when a
-  page's URL ends in its `.wasm` file, runs on its own thread, draws into the
-  child window and receives input from it. The QEMU command line is fixed in
-  `src/app.rs`, which also locks the disk image.
+- **GUI** (`m-browser`): the winit event loop and `App`. Each tab shows a
+  Markdown page or runs the `.wasm` file its address names: QEMU, a
+  wasi-gfx component (each drawing into a child window of its own and
+  receiving input from it), or another core module (its output on a text
+  page). A tab's program pauses while the tab is in the background. The
+  QEMU command line is fixed in `src/tab_program.rs`, which also locks the
+  disk image.
 - **Headless** (`m-browser --qemu-headless ...`): `headless::run` and no
-  window. The remaining arguments choose the module and QEMU's options; the
-  screen is written to PNG files, and keys come from `QEMU_TYPE` or
+  window. The remaining arguments choose the module and QEMU's options, or
+  a checkpoint to resume (`--resume`); the screen is written to PNG files,
+  and keys, and pause and save commands, come from `QEMU_TYPE` or
   `QEMU_TYPE_FIFO`. It is meant for automation and tests; see
   [11-headless-and-automation.md](11-headless-and-automation.md).
+- **Generic headless** (`m-browser --wasm-headless ...`): `wasm_headless::run`
+  runs any other core module with WASI preview 1, and can pause it, hibernate
+  it to a `.wasmsavestate` file and resume it from there; see
+  [15-saved-states.md](15-saved-states.md). It shares nothing with QEMU's
+  runner.
 
-Both modes end up in the same `run_wasm_module`, so everything below the QEMU
-thread in the diagram is shared. Only the source of input, the display target
-(`surface` is `None` when headless) and who sets the stop flag differ.
+The first two end up in the same `run_wasm_module`, so everything below the
+QEMU thread in the diagram is shared. Only the source of input, the display
+target (`surface` is `None` when headless) and who sets the stop flag differ.
 
 ## Two QEMU flavors
 
@@ -168,17 +183,18 @@ The details, including how a vCPU thread enters QEMU (`host_vcpu_run`,
 
 ### 1. Startup: from the address bar to the first frame
 
-1. The user opens `file:///.../qemu-system-x86_64.wasm`. `App` recognizes a
-   wasm page and sets `spawn_child_window`.
-2. In `App::window_event`, the UI thread stops a previous QEMU if one runs
-   (`stop_qemu`), creates the child window, wraps it in a
-   `wasi_surface_wasmtime::Surface`, creates a `GfxEventQueue` and a stop
-   flag, and spawns the QEMU thread. It keeps a `QemuRun` (stop flag and
-   thread handle).
-3. The QEMU thread waits for the previous QEMU thread to finish, then locks
-   `m.qcow2` (`lock_disk_image`) and calls `run_wasm_module` with QEMU's
-   arguments and the preopened directories (`m.qcow2` appears to QEMU as
-   `/data/m.qcow2`, `pc-bios` as `/bios`).
+1. The user opens `file:///.../qemu-system-x86_64.wasm` in a tab. The UI
+   queues an `Action::Go`; `App::load()` stops the tab's previous program,
+   if any, and `start_program()` finds QEMU's imports (`module_kind`).
+2. On the UI thread, `start_program()` creates a child window and
+   `QemuTab::start()` wraps it in a `wasi_surface_wasmtime::Surface`,
+   creates a `GfxEventQueue`, a `QemuControl` and a stop flag, and spawns
+   the QEMU thread. The tab keeps them in its `TabProgram::Qemu`.
+3. The QEMU thread locks `m.qcow2` (`lock_disk_image`, waiting up to 12 s
+   for a QEMU that is still quitting) and calls `run_wasm_module` with
+   QEMU's arguments, the preopened directories (`m.qcow2` appears to QEMU
+   as `/data/m.qcow2`, `pc-bios` as `/bios`) and a `Saving` naming the
+   tab.
 4. `run_wasm_module` creates the wasmtime `Engine` and loads QEMU's module
    with `load_qemu_module`: the first time, it is compiled with optimizations
    (this takes a while) and cached in `~/.cache/m-browser/`; later runs load
@@ -254,10 +270,10 @@ Details: [09-display-and-input.md](09-display-and-input.md).
 
 1. winit delivers a `WindowEvent::KeyboardInput` to `App::window_event` on the
    UI thread.
-2. If the child window is shown and egui does not want the key,
-   `keycode_to_evdev` turns the key into a Linux evdev code and an
-   `InputEvent` is pushed into the `GfxEventQueue`. Mouse moves and buttons
-   take the same queue.
+2. If the current tab runs QEMU and egui does not want the key,
+   `QemuTab::handle_event` has `keycode_to_evdev` turn the key into a Linux
+   evdev code and pushes an `InputEvent` into the tab's `GfxEventQueue`.
+   Mouse moves and buttons over QEMU's window take the same queue.
 3. During its main loop, QEMU calls `host_gfx_poll_events`, which moves the
    queued events into QEMU's memory.
 4. QEMU feeds them to its emulated keyboard and tablet, and the guest sees the
@@ -284,10 +300,11 @@ Details: [10-networking.md](10-networking.md).
 
 ### 7. Shutdown
 
-1. Closing the child window, leaving the page or closing the browser calls
-   `App::stop_qemu`: input stops being queued and the stop flag is set.
-   Closing the browser (`shutdown_qemu`) also waits a while for the QEMU
-   thread.
+1. Leaving the page, closing the tab or closing the browser calls
+   `TabProgram::stop`: QEMU's window hides and its stop flag is set.
+   Closing the browser (`App::shutdown`) also waits up to 5 s for the
+   QEMU threads. (Merely switching to another tab only pauses QEMU; see
+   [05-browser-ui.md](05-browser-ui.md#pausing-kind-by-kind).)
 2. Between two steps, `run_qemu_reactor` sees the flag and calls
    `wasi_qemu_quit`: QEMU powers the guest off and closes its disk images.
 3. The next `wasi_qemu_step` returns an exit status, `run_wasm_module`
@@ -303,12 +320,14 @@ Details: [05-browser-ui.md](05-browser-ui.md) and
 | Thread | Created by | Runs | Lifetime |
 |---|---|---|---|
 | main (UI) | the operating system | winit event loop, `App`, egui and wgpu; headless: `headless::run` and QEMU | the process |
-| QEMU thread (unnamed) | `App::window_event` (`std::thread::spawn`) | `lock_disk_image`, `run_wasm_module`, `run_qemu_reactor` | from opening the page until QEMU has quit |
+| QEMU thread (unnamed), one per QEMU tab | `QemuTab::start` (`std::thread::spawn`) | `lock_disk_image`, `run_wasm_module`, `run_qemu_reactor` | from opening the page until QEMU has quit |
 | `qemu-jit-N` | `BackgroundCompiler::start`, at QEMU's first background compile | Cranelift compilation of TB modules | until the QEMU run's `JitCache` is dropped (threaded build: until m-browser exits, see [known-issues.md](known-issues.md)) |
 | `qemu-<tid>` | `QemuThreads::spawn` (`wasi.thread-spawn`) | one of QEMU's threads in its own Store: usually `qemu-1` is RCU's `call_rcu`, then one per vCPU | meant to end with QEMU; from reading the code they stay blocked until m-browser exits ([known-issues.md](known-issues.md)) |
 | `qemu-net` | `VirtualNet::start`, when `run_wasm_module` builds the Linker | `Stack::run`: frames, host sockets | until the QEMU run's network is dropped (threaded build: until m-browser exits) |
 | `qemu-profile` | `qemu_profile::start` (`QEMU_PROFILE=1`) | the profiler's sampling tick | until `qemu_profile::stop` |
-| component threads (unnamed) | `App::window_event` | a wasi-gfx component (`Wasm`), and a watcher for the close signal | while the component runs |
+| component threads (unnamed), two per component tab | `ComponentTab::start` | a wasi-gfx component (`Wasm`); its animation frames, sent while it is not paused | while the component runs |
+| core module thread (unnamed), one per text-page tab | `CoreTab::start` | `wasm_headless::start`, its output into an `OutputPage` | while the program runs |
+| control and timer threads (unnamed) | `wasm_headless::run`, with `WASM_CONTROL_FIFO` or `WASM_HIBERNATE_AFTER` | reading commands from the pipe; sleeping until it is time to hibernate | until m-browser exits (generic headless mode only) |
 
 **Pitfall:** the QEMU thread is not named, so debuggers and `top -H` show it
 under the program's name.
@@ -328,6 +347,16 @@ under the program's name.
   (threaded build), the stop flag (`Arc<AtomicBool>`).
 - **Per QEMU run, held by the Linker's closures**: the network
   (`VirtualNet`, one per Linker, so one per QEMU start).
+- **Per QEMU run, held by `run_qemu_reactor`**: the `Saver`
+  (`src/qemu_save.rs`): QEMU's current arguments, a save or a resume under
+  way. Its requests come through a `QemuControl` (`Arc<Mutex<...>>`) shared
+  with the thread that sends them: the headless runner's FIFO reader, or
+  the UI thread, which pauses and continues a tab's QEMU.
+- **Per tab, on the UI thread**: the `Tab` (page, history) and its
+  `TabProgram` (`src/tab_program.rs`): the program's child window, its
+  controls (`QemuControl` and stop flag, `ComponentControl`, or
+  `wasm_headless::Control`), and handles shared with its threads (the
+  `GfxEventQueue`, an `OutputPage`, a status string).
 - **Global**: the profiler, and settings read once from environment
   variables (for example `migrate_after_instances`).
 
@@ -364,22 +393,32 @@ safely.
   surface and uses the same surface type as wasi-gfx components.
 - **The disk image is locked.** Two QEMUs writing the same qcow2 image corrupt
   it, and QEMU on WASI cannot lock files itself, so `lock_disk_image` takes
-  the lock before QEMU starts and a new QEMU waits for the previous one.
+  the lock before QEMU starts, and a new QEMU waits a while for one that is
+  quitting.
+- **Tabs own their programs.** Each tab keeps its program and, for QEMU
+  and components, its own child window; leaving the tab pauses the
+  program and hides the window instead of stopping it, so coming back
+  costs nothing and loses nothing. Pausing uses each kind's own safe
+  stopping place: QEMU's monitor (`stop`), wasmtime's epochs for
+  components, save points for other core modules.
 
 ## Where to start for common tasks
 
 | Task | Files | Chapter |
 |---|---|---|
-| Change the browser UI or the pages | `src/app.rs`, `src/egui_tools.rs` | [05](05-browser-ui.md) |
-| Change QEMU's options (memory, devices, disk) | `src/app.rs`, `src/headless.rs` | [05](05-browser-ui.md), [11](11-headless-and-automation.md) |
+| Change the browser UI, tabs or the pages | `src/app.rs`, `src/egui_tools.rs` | [05](05-browser-ui.md) |
+| Change what a tab's program does in the background | `src/tab_program.rs` | [05](05-browser-ui.md#a-tabs-program) |
+| Change QEMU's options (memory, devices, disk) | `src/tab_program.rs`, `src/headless.rs` | [05](05-browser-ui.md), [11](11-headless-and-automation.md) |
 | Add a host import | `src/qemu_*.rs`, `run_wasm_module` | [13](13-adding-features.md), [host imports](reference/host-imports.md) |
 | Add an environment-variable knob | the module concerned | [13](13-adding-features.md), [variables](reference/environment-variables.md) |
 | JIT speed, compile errors, TB modules | `src/qemu_jit.rs` | [07](07-jit-host.md) |
 | Memory growth, map-count aborts, migration | `src/wasm.rs` | [06](06-qemu-runner.md) |
 | vCPU threads, races, `QEMU_SMP` | `src/qemu_threads.rs` | [08](08-threads.md) |
-| Screen, keyboard, mouse | `src/qemu_gfx.rs`, `src/qemu_keymap.rs`, `src/app.rs` | [09](09-display-and-input.md) |
+| Screen, keyboard, mouse | `src/qemu_gfx.rs`, `src/qemu_keymap.rs`, `src/tab_program.rs` | [09](09-display-and-input.md) |
 | Guest network, port forwarding | `src/qemu_net.rs`, `src/qemu_net/tcp.rs` | [10](10-networking.md) |
 | Boot QEMU from a script or a test | `src/headless.rs` | [11](11-headless-and-automation.md) |
+| Run, pause, save or resume another core module; the saved-state format | `src/wasm_headless.rs`, `src/saved_state.rs`, `src/saved_state/` | [15](15-saved-states.md) |
+| Pause, save or resume QEMU | `src/qemu_save.rs`, `src/headless.rs`, `run_qemu_reactor` | [15](15-saved-states.md#qemu-checkpoints) |
 | Find where the time goes | `src/qemu_profile.rs` | [12](12-profiling.md) |
 | A trap, a crash, a failing test | | [14](14-testing-and-debugging.md) |
 | Build, run, update QEMU | | [03](03-getting-started.md) |

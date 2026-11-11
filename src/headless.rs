@@ -6,10 +6,12 @@
 //!
 //! Usage:
 //!   m-browser --qemu-headless [--preopen HOST=GUEST]... <qemu.wasm> [qemu args...]
+//!   m-browser --qemu-headless [--preopen HOST=GUEST]... --resume <file.wasmsavestate>
 //!
 //! As in the GUI, `./pc-bios` is preopened as `/bios` and `.` as `/data`.
 //! Extra directories (e.g. somewhere to write logs) can be added with
-//! `--preopen`.
+//! `--preopen`. `--resume` starts QEMU from a checkpoint (qemu_save.rs),
+//! with the module, arguments and directories it was saved with.
 //!
 //! Environment:
 //!   QEMU_SNAPSHOT=<file.png>  write the display to this PNG about once a second
@@ -20,8 +22,15 @@
 //!                             QEMU_TYPE='10:info registers\n;20:info status\n'
 //!   QEMU_TYPE_FIFO=<path>     type each line written to this named pipe
 //!                             (see mkfifo), followed by Enter; lines starting
-//!                             with `!` are pointer commands (`!move X Y`,
-//!                             `!click BUTTON`; see `pointer_command`)
+//!                             with `!` are commands: pointer (`!move X Y`,
+//!                             `!click BUTTON`; see `pointer_command`),
+//!                             pause and save (`!pause`, `!continue`, `!save`,
+//!                             `!monitor CMD`; see `save_command`), or
+//!                             `!url ADDRESS`: Ctrl+L, the address and Enter
+//!                             for the guest's Chromium, as a web tab sends
+//!   QEMU_SAVE_DIR=<dir>       where `!save` writes checkpoints and the disk
+//!                             overlays that go with them (default `.`); QEMU
+//!                             must reach it through a preopen
 //!   QEMU_QUIT_AFTER=<secs>    ask QEMU to quit after this long, as the GUI
 //!                             does when its window closes
 
@@ -38,39 +47,64 @@ pub fn run(args: &[String]) -> Result<()> {
         ("pc-bios".into(), "/bios".into()),
         (".".into(), "/data".into()),
     ];
+    let mut extra_preopens = Vec::new();
+    let mut resume = None;
 
     let mut rest = args;
     while let Some(flag) = rest.first() {
-        if flag != "--preopen" {
-            break;
+        match flag.as_str() {
+            "--preopen" => {
+                let spec = rest.get(1).context("--preopen needs HOST=GUEST")?;
+                let (host, guest) = spec
+                    .split_once('=')
+                    .with_context(|| format!("--preopen expects HOST=GUEST, got {spec:?}"))?;
+                extra_preopens.push((host.to_string(), guest.to_string()));
+            }
+            "--resume" => {
+                let file = rest.get(1).context("--resume needs a .wasmsavestate file")?;
+                resume = Some(crate::qemu_save::prepare_resume(std::path::Path::new(file))?);
+            }
+            _ => break,
         }
-        let spec = rest.get(1).context("--preopen needs HOST=GUEST")?;
-        let (host, guest) = spec
-            .split_once('=')
-            .with_context(|| format!("--preopen expects HOST=GUEST, got {spec:?}"))?;
-        preopens.push((host.into(), guest.into()));
         rest = &rest[2..];
     }
 
-    let Some((wasm_path, qemu_args)) = rest.split_first() else {
-        bail!("usage: m-browser --qemu-headless [--preopen HOST=GUEST]... <qemu.wasm> [qemu args...]");
+    // A checkpoint brings QEMU's module, arguments and directories.
+    let (wasm_path, argv): (String, Vec<String>) = match &resume {
+        Some(resume) => {
+            if !rest.is_empty() {
+                bail!("--resume takes no module or QEMU arguments: they come from the checkpoint");
+            }
+            preopens = resume.preopens.clone();
+            eprintln!("[headless] resuming {}", resume.path.display());
+            (resume.module.to_string_lossy().into_owned(), resume.args.clone())
+        }
+        None => {
+            let Some((wasm_path, qemu_args)) = rest.split_first() else {
+                bail!(
+                    "usage: m-browser --qemu-headless [--preopen HOST=GUEST]... <qemu.wasm> [qemu args...]\n       \
+                     m-browser --qemu-headless [--preopen HOST=GUEST]... --resume <file.wasmsavestate>"
+                );
+            };
+            // argv[0] for the guest, then the caller's arguments verbatim.
+            let argv = std::iter::once("qemu-system-x86_64".to_string()).chain(qemu_args.iter().cloned()).collect();
+            (wasm_path.clone(), argv)
+        }
     };
-
-    // argv[0] for the guest, then the caller's arguments verbatim.
-    let argv: Vec<&str> = std::iter::once("qemu-system-x86_64")
-        .chain(qemu_args.iter().map(String::as_str))
-        .collect();
+    preopens.extend(extra_preopens);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     let preopen_refs: Vec<(&str, &str)> = preopens
         .iter()
         .map(|(h, g)| (h.as_str(), g.as_str()))
         .collect();
 
     let queue = crate::qemu_gfx::new_event_queue();
+    let control = crate::qemu_save::QemuControl::new();
     if let Ok(script) = std::env::var("QEMU_TYPE") {
         spawn_typist(&script, queue.clone())?;
     }
     if let Some(path) = std::env::var_os("QEMU_TYPE_FIFO") {
-        spawn_fifo_typist(path.into(), queue.clone());
+        spawn_fifo_typist(path.into(), queue.clone(), control.clone());
     }
 
     let stop = match std::env::var("QEMU_QUIT_AFTER") {
@@ -89,55 +123,8 @@ pub fn run(args: &[String]) -> Result<()> {
     };
 
     eprintln!("[headless] running {wasm_path} with args {:?}", &argv[1..]);
-    crate::wasm::run_wasm_module(wasm_path, &argv, &preopen_refs, None, queue, stop)
-}
-
-/// Linux evdev code for a character on a US keyboard, and whether it needs
-/// Shift. Used so typed text also reaches the guest's own keyboard.
-fn char_to_evdev(ch: char) -> Option<(i32, bool)> {
-    const LETTERS: &[u8; 26] = &[
-        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17,
-        45, 21, 44,
-    ];
-    const DIGITS: &[u8; 10] = &[11, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-    const SHIFTED_DIGITS: &str = ")!@#$%^&*(";
-    let key = match ch {
-        'a'..='z' => (LETTERS[(ch as u8 - b'a') as usize] as i32, false),
-        'A'..='Z' => (LETTERS[(ch as u8 - b'A') as usize] as i32, true),
-        '0'..='9' => (DIGITS[(ch as u8 - b'0') as usize] as i32, false),
-        '\r' | '\n' => (28, false),
-        '\t' => (15, false),
-        '\u{1b}' => (1, false),
-        '\u{7f}' | '\u{8}' => (14, false),
-        ' ' => (57, false),
-        '-' => (12, false),
-        '_' => (12, true),
-        '=' => (13, false),
-        '+' => (13, true),
-        '[' => (26, false),
-        '{' => (26, true),
-        ']' => (27, false),
-        '}' => (27, true),
-        ';' => (39, false),
-        ':' => (39, true),
-        '\'' => (40, false),
-        '"' => (40, true),
-        '`' => (41, false),
-        '~' => (41, true),
-        '\\' => (43, false),
-        '|' => (43, true),
-        ',' => (51, false),
-        '<' => (51, true),
-        '.' => (52, false),
-        '>' => (52, true),
-        '/' => (53, false),
-        '?' => (53, true),
-        _ => {
-            let i = SHIFTED_DIGITS.find(ch)?;
-            (DIGITS[i] as i32, true)
-        }
-    };
-    Some(key)
+    let saving = crate::qemu_save::Saving { control, resume, owner: None };
+    crate::wasm::run_wasm_module(&wasm_path, &argv, &preopen_refs, None, queue, stop, Some(saving))
 }
 
 /// Parse a QEMU_TYPE script and feed it into the event queue on a timer.
@@ -177,7 +164,7 @@ fn spawn_typist(script: &str, queue: GfxEventQueue) -> Result<()> {
 /// Type each line written to the named pipe at `path` (create it with
 /// mkfifo), followed by Enter. Lets a person or script drive a running
 /// headless guest, e.g. `echo root > /tmp/type.fifo`.
-fn spawn_fifo_typist(path: std::path::PathBuf, queue: GfxEventQueue) {
+fn spawn_fifo_typist(path: std::path::PathBuf, queue: GfxEventQueue, control: crate::qemu_save::QemuControl) {
     use std::io::BufRead;
 
     std::thread::spawn(move || loop {
@@ -190,13 +177,50 @@ fn spawn_fifo_typist(path: std::path::PathBuf, queue: GfxEventQueue) {
             }
         };
         for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-            if let Some(cmd) = line.strip_prefix('!') {
-                pointer_command(&queue, cmd);
+            if let Some(url) = line.strip_prefix("!url ") {
+                open_url(&queue, url.trim());
+            } else if let Some(cmd) = line.strip_prefix('!') {
+                if !save_command(&control, cmd) {
+                    pointer_command(&queue, cmd);
+                }
             } else {
                 type_text(&queue, &format!("{line}\r"));
             }
         }
     });
+}
+
+/// `!url ADDRESS`: the keys a web tab sends to its Chromium
+/// (`QemuTab::type_url` in tab_program.rs), all queued at once: QEMU's
+/// display delivers them a few per refresh.
+fn open_url(queue: &GfxEventQueue, url: &str) {
+    use crate::qemu_keymap::{chord_events, text_events, KEY_L, KEY_LEFTCTRL};
+    eprintln!("[headless] opening {url}");
+    let mut events = chord_events(KEY_LEFTCTRL, KEY_L);
+    events.extend(text_events(&format!("{url}\n")));
+    if let Ok(mut q) = queue.lock() {
+        q.extend(events);
+    }
+}
+
+/// Pause and save commands for the FIFO typist (see qemu_save.rs):
+/// `!pause`, `!continue`, `!save` (write a checkpoint) and `!monitor CMD`
+/// (run a QEMU monitor command, printing its output). Returns false for
+/// other commands.
+fn save_command(control: &crate::qemu_save::QemuControl, cmd: &str) -> bool {
+    use crate::qemu_save::Request;
+    let request = match cmd.trim() {
+        "pause" => Request::Pause,
+        "continue" => Request::Continue,
+        "save" => Request::Save,
+        other => match other.strip_prefix("monitor ") {
+            Some(text) => Request::Monitor(text.trim().to_string()),
+            None => return false,
+        },
+    };
+    eprintln!("[headless] {}", cmd.trim());
+    control.send(request);
+    true
 }
 
 /// Pointer commands for the FIFO typist, in window pixels:
@@ -245,7 +269,7 @@ fn type_text(queue: &GfxEventQueue, text: &str) {
                 value: down as i32,
             })
         };
-        if let Some((code, shift)) = char_to_evdev(ch) {
+        if let Some((code, shift)) = crate::qemu_keymap::char_to_evdev(ch) {
             if shift {
                 key(&mut q, KEY_LEFTSHIFT, true);
             }

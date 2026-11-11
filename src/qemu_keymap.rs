@@ -165,3 +165,117 @@ pub fn keycode_to_evdev(code: KeyCode) -> Option<i32> {
     };
     Some(v)
 }
+
+/// Linux evdev code for a character on a US keyboard, and whether it needs
+/// Shift. Used so typed text also reaches the guest's own keyboard.
+pub fn char_to_evdev(ch: char) -> Option<(i32, bool)> {
+    const LETTERS: &[u8; 26] = &[
+        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, 49, 24, 25, 16, 19, 31, 20, 22, 47, 17,
+        45, 21, 44,
+    ];
+    const DIGITS: &[u8; 10] = &[11, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const SHIFTED_DIGITS: &str = ")!@#$%^&*(";
+    let key = match ch {
+        'a'..='z' => (LETTERS[(ch as u8 - b'a') as usize] as i32, false),
+        'A'..='Z' => (LETTERS[(ch as u8 - b'A') as usize] as i32, true),
+        '0'..='9' => (DIGITS[(ch as u8 - b'0') as usize] as i32, false),
+        '\r' | '\n' => (KEY_ENTER, false),
+        '\t' => (15, false),
+        '\u{1b}' => (1, false),
+        '\u{7f}' | '\u{8}' => (14, false),
+        ' ' => (57, false),
+        '-' => (12, false),
+        '_' => (12, true),
+        '=' => (13, false),
+        '+' => (13, true),
+        '[' => (26, false),
+        '{' => (26, true),
+        ']' => (27, false),
+        '}' => (27, true),
+        ';' => (39, false),
+        ':' => (39, true),
+        '\'' => (40, false),
+        '"' => (40, true),
+        '`' => (41, false),
+        '~' => (41, true),
+        '\\' => (43, false),
+        '|' => (43, true),
+        ',' => (51, false),
+        '<' => (51, true),
+        '.' => (52, false),
+        '>' => (52, true),
+        '/' => (53, false),
+        '?' => (53, true),
+        _ => {
+            let i = SHIFTED_DIGITS.find(ch)?;
+            (DIGITS[i] as i32, true)
+        }
+    };
+    Some(key)
+}
+
+/// evdev codes used by `text_events` and for shortcuts.
+pub const KEY_LEFTCTRL: i32 = 29;
+pub const KEY_LEFTSHIFT: i32 = 42;
+pub const KEY_ENTER: i32 = 28;
+pub const KEY_L: i32 = 38;
+
+/// Events typing `text`: for each character a key press and release (with
+/// Shift where needed) for the guest's keyboard, plus a text event (type 5)
+/// for QEMU's text consoles; each kind of console ignores the other. `\n`
+/// and `\r` are Enter. Characters a US keyboard does not have are sent as
+/// text only. QEMU's display delivers queued key events at its own pace (a
+/// few per display refresh), so the whole text can be queued at once.
+pub fn text_events(text: &str) -> Vec<crate::qemu_gfx::InputEvent> {
+    use crate::qemu_gfx::InputEvent;
+    const KEY: i32 = 3;
+    const TEXT: i32 = 5;
+    let key = |code: i32, down: bool| InputEvent { event_type: KEY, code, value: down as i32 };
+    let mut events = Vec::new();
+    for ch in text.chars() {
+        let ch = if ch == '\n' { '\r' } else { ch };
+        if let Some((code, shift)) = char_to_evdev(ch) {
+            if shift {
+                events.push(key(KEY_LEFTSHIFT, true));
+            }
+            events.push(key(code, true));
+            events.push(key(code, false));
+            if shift {
+                events.push(key(KEY_LEFTSHIFT, false));
+            }
+        }
+        events.push(InputEvent { event_type: TEXT, code: ch as i32, value: 0 });
+    }
+    events
+}
+
+/// Events pressing `key` while `modifier` is held, such as Ctrl+L.
+pub fn chord_events(modifier: i32, key: i32) -> Vec<crate::qemu_gfx::InputEvent> {
+    use crate::qemu_gfx::InputEvent;
+    let event = |code: i32, down: bool| InputEvent { event_type: 3, code, value: down as i32 };
+    vec![event(modifier, true), event(key, true), event(key, false), event(modifier, false)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_becomes_key_presses() {
+        let events: Vec<(i32, i32, i32)> =
+            text_events("aB\n").iter().map(|e| (e.event_type, e.code, e.value)).collect();
+        assert_eq!(
+            events,
+            [
+                (3, 30, 1), (3, 30, 0), (5, 'a' as i32, 0),
+                (3, KEY_LEFTSHIFT, 1), (3, 48, 1), (3, 48, 0), (3, KEY_LEFTSHIFT, 0), (5, 'B' as i32, 0),
+                (3, KEY_ENTER, 1), (3, KEY_ENTER, 0), (5, '\r' as i32, 0),
+            ]
+        );
+        let ctrl_l: Vec<(i32, i32)> = chord_events(KEY_LEFTCTRL, KEY_L).iter().map(|e| (e.code, e.value)).collect();
+        assert_eq!(ctrl_l, [(29, 1), (38, 1), (38, 0), (29, 0)]);
+        assert_eq!(char_to_evdev('/'), Some((53, false)));
+        assert_eq!(char_to_evdev(':'), Some((39, true)));
+        assert_eq!(char_to_evdev('\u{e9}'), None);
+    }
+}
